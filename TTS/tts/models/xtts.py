@@ -7,6 +7,7 @@ import torch.nn.functional as F
 import torchaudio
 from coqpit import Coqpit
 
+
 from TTS.tts.layers.xtts.gpt import GPT
 from TTS.tts.layers.xtts.hifigan_decoder import HifiDecoder
 from TTS.tts.layers.xtts.stream_generator import init_stream_support
@@ -14,6 +15,8 @@ from TTS.tts.layers.xtts.tokenizer import VoiceBpeTokenizer, split_sentence
 from TTS.tts.layers.xtts.xtts_manager import SpeakerManager, LanguageManager
 from TTS.tts.models.base_tts import BaseTTS
 from TTS.utils.io import load_fsspec
+
+
 
 init_stream_support()
 
@@ -789,3 +792,126 @@ class Xtts(BaseTTS):
         raise NotImplementedError(
             "XTTS has a dedicated trainer, please check the XTTS docs: https://tts.readthedocs.io/en/dev/models/xtts.html#training"
         )
+
+
+    @torch.no_grad()
+    def forward_from_audios_and_text(
+        self,
+        lang,
+        text,
+        target_sample,
+        ref_sample,
+        train_model,
+        max_conditioning_length,
+        min_conditioning_length,
+    ):
+        from TTS.tts.layers.xtts.trainer.dataset import get_prompt_slice
+        device = self.device 
+
+        wav = load_audio(target_sample, 22050)
+        tokens = self.tokenizer.encode(text, lang)#train_model.xtts.tokenizer.encode(text, lang)
+        tseq = torch.IntTensor(tokens)
+        cond, cond_len, _ = get_prompt_slice(
+            ref_sample, max_conditioning_length, min_conditioning_length, 22050, True
+            )
+
+        cond_idxs = torch.nan
+
+        sample = {
+            # 'real_text': text,
+            "text": tseq,
+            "text_lengths": torch.tensor(tseq.shape[0], dtype=torch.long),
+            "wav": wav,
+            "wav_lengths": torch.tensor(wav.shape[-1], dtype=torch.long),
+            "filenames": target_sample,
+            "conditioning": cond.unsqueeze(1),
+            "cond_lens": torch.tensor(cond_len, dtype=torch.long)
+            if cond_len is not torch.nan
+            else torch.tensor([cond_len]),
+            "cond_idxs": torch.tensor(cond_idxs) if cond_idxs is not torch.nan else torch.tensor([cond_idxs]),
+        }
+
+        collated = self.collate_fn([sample])
+        for k, v in collated.items():
+            if isinstance(v, torch.Tensor):
+                collated[k] = v.to(device)
+        o = train_model.format_batch_on_device(collated)
+
+
+        cond_mels = o["cond_mels"].to(device)
+        text_inputs = o["text_inputs"].to(device)
+        text_lengths = o["text_lengths"].to(device)
+        audio_codes = o["audio_codes"].to(device)
+        wav_lengths = o["wav_lengths"].to(device)
+        cond_lens = o["cond_lens"].to(device)
+        train_model = train_model.to(device)
+
+        train_model.training = False
+        with torch.no_grad():
+            (gpt_cond_latent, speaker_embedding) = self.get_conditioning_latents(
+                audio_path=ref_sample,
+                gpt_cond_len=45,
+                gpt_cond_chunk_len=15,
+                max_ref_length=45,
+                sound_norm_refs=False,
+            )
+
+
+            gpt_latents = self.gpt(
+                text_inputs,
+                text_lengths,
+                audio_codes,
+                wav_lengths,
+                cond_latents=gpt_cond_latent,
+                return_attentions=False,
+                return_latent=True,
+            )
+
+            gpt_latents.shape, speaker_embedding.shape
+                
+
+        wav_audio_codes = self.hifigan_decoder(gpt_latents, g=speaker_embedding).cpu().squeeze()
+
+
+        return {
+            "wav": wav_audio_codes.cpu().squeeze().numpy(),
+        }
+
+    def collate_fn(self, batch):
+        # convert list of dicts to dict of lists
+        B = len(batch)
+
+        batch = {k: [dic[k] for dic in batch] for k in batch[0]}
+
+        # stack for features that already have the same shape
+        batch["wav_lengths"] = torch.stack(batch["wav_lengths"])
+        batch["text_lengths"] = torch.stack(batch["text_lengths"])
+        batch["conditioning"] = torch.stack(batch["conditioning"])
+        batch["cond_lens"] = torch.stack(batch["cond_lens"])
+        batch["cond_idxs"] = torch.stack(batch["cond_idxs"])
+
+        if torch.any(batch["cond_idxs"].isnan()):
+            batch["cond_idxs"] = None
+
+        if torch.any(batch["cond_lens"].isnan()):
+            batch["cond_lens"] = None
+
+        max_text_len = batch["text_lengths"].max()
+        max_wav_len = batch["wav_lengths"].max()
+
+        # create padding tensors
+        text_padded = torch.IntTensor(B, max_text_len)
+        wav_padded = torch.FloatTensor(B, 1, max_wav_len)
+
+        # initialize tensors for zero padding
+        text_padded = text_padded.zero_()
+        wav_padded = wav_padded.zero_()
+        for i in range(B):
+            text = batch["text"][i]
+            text_padded[i, : batch["text_lengths"][i]] = torch.IntTensor(text)
+            wav = batch["wav"][i]
+            wav_padded[i, :, : batch["wav_lengths"][i]] = torch.FloatTensor(wav)
+
+        batch["wav"] = wav_padded
+        batch["padded_text"] = text_padded
+        return batch

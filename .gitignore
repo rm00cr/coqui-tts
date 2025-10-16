@@ -170,3 +170,8 @@ depot/*
 coqui_recipes/*
 local_scripts/*
 coqui_demos/*
+
+*.wav
+./test_data/*
+config.json
+vocab.json

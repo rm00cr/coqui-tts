@@ -51,7 +51,7 @@ def load_fsspec(
             return torch.load(f, map_location=map_location, **kwargs)
     else:
         with fsspec.open(path, "rb") as f:
-            return torch.load(f, map_location=map_location, **kwargs)
+            return torch.load(f, map_location=map_location, weights_only=False, **kwargs)
 
 
 def load_checkpoint(

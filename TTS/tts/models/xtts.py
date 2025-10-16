@@ -811,8 +811,21 @@ class Xtts(BaseTTS):
         wav = load_audio(target_sample, 22050)
         tokens = self.tokenizer.encode(text, lang)#train_model.xtts.tokenizer.encode(text, lang)
         tseq = torch.IntTensor(tokens)
-        cond, cond_len, _ = get_prompt_slice(
-            ref_sample, max_conditioning_length, min_conditioning_length, 22050, True
+
+        if isinstance(ref_sample, list):
+            conds, cond_lens = [], []
+            for ref in ref_sample:
+                cond, cond_len, _ = get_prompt_slice(
+                    ref, max_conditioning_length, min_conditioning_length, 22050, True
+                )
+                conds.append(cond)
+                cond_lens.append(cond_len)
+            # Example: average conditioning
+            cond = torch.stack(conds).mean(dim=0)
+            cond_len = int(sum(cond_lens) / len(cond_lens))
+        else:
+            cond, cond_len, _ = get_prompt_slice(
+                ref_sample, max_conditioning_length, min_conditioning_length, 22050, True
             )
 
         cond_idxs = torch.nan

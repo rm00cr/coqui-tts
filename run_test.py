@@ -16,10 +16,10 @@ warnings.filterwarnings("ignore", category=UserWarning, module="torchaudio")
 
 
 # Paths
-references_dir = "/home/romolo/VT1/COQUI_TTS/test_data/Dataset/references"
-targets_dir = "/home/romolo/VT1/COQUI_TTS/test_data/Dataset/targets"
-output_dir = "/home/romolo/VT1/COQUI_TTS/prog/streamlit_prog/outputs/"
-csv_output_dir = "/home/romolo/VT1/COQUI_TTS/prog/streamlit_prog/outputs/csv/"
+references_dir = "/home/romolo/VT1/coqui-tts/test_data/Dataset/references"
+targets_dir = "/home/romolo/VT1/coqui-tts/test_data/Dataset/targets"
+output_dir = "/home/romolo/VT1/prog/streamlit_prog/outputs/"
+csv_output_dir = "/home/romolo/VT1/prog/streamlit_prog/outputs/csv/"
 
 
 # Load your XTTS model (customize as needed)
@@ -117,9 +117,9 @@ def process_reference(ref_file, model, output_dir, train_model, config):
         target_speakers = [os.path.join(target_path, spk) for spk in target_speakers]
         result = model.forward_from_audios_and_text(
             'en',
-            target_text=get_whisper_text(target_speakers[0], asr_model),
-            reference_audio_path=ref_speakers[0],
-            target_audio_path=target_speakers[0],
+            text=get_whisper_text(target_speakers[0], asr_model),
+            target_sample=target_speakers[0],
+            ref_sample=ref_speakers,
             train_model=train_model,
             max_conditioning_length=config.model_args.max_conditioning_length,
             min_conditioning_length=config.model_args.min_conditioning_length
@@ -173,4 +173,4 @@ def main(model_name: str, output_dir: str = output_dir, name:str =f'{time.time()
     tqdm.tqdm.write(f"Metadata saved to metadata_{model_name}_{name}.csv")
 
 if __name__ == "__main__":
-    main("xtts2",output_dir)
+    main("xtts2", output_dir, name=f'{time.time()}_target_as_target_ref_as_ref_en')

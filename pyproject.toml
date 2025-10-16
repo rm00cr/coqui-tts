@@ -1,10 +1,41 @@
+[project]
+name = "coqui-tts"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "anyascii>=0.3.3",
+    "bangla>=0.0.5",
+    "bnnumerizer>=0.0.2",
+    "bnunicodenormalizer>=0.1.7",
+    "coqpit>=0.0.17",
+    "gruut>=2.4.0",
+    "inflect>=7.5.0",
+    "jamo>=0.4.1",
+    "jieba>=0.42.1",
+    "librosa>=0.11.0",
+    "matplotlib>=3.10.7",
+    "mutagen>=1.47.0",
+    "numpy==1.26.4",
+    "pandas>=2.3.3",
+    "pypinyin>=0.55.0",
+    "pysbd>=0.3.4",
+    "torch==2.6",
+    "torchaudio>=2.6.0",
+    "trainer>=0.0.36",
+    "transformers==4.33",
+]
+
+
+
 [build-system]
 requires = [
-    "setuptools",
-    "wheel",
-    "cython~=0.29.30",
-    "numpy>=1.22.0",
-    "packaging",
+"setuptools",
+"wheel",
+"cython~=0.29.30",
+"numpy>=1.22.0",
+"packaging",
 ]
 
 [flake8]
@@ -17,4 +48,3 @@ target-version = ['py39']
 [tool.isort]
 line_length = 120
 profile = "black"
-multi_line_output = 3

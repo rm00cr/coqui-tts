@@ -4,13 +4,14 @@ import pandas as pd
 import torch
 import time
 # Test XTTS anonymize_inference
-
+import numpy as np
 
 from concurrent.futures import ThreadPoolExecutor
 
 import warnings
 
 from model_conf import ModelPaths, load_tts_and_trainer
+from development.utils import iterative_segment_refinement
 warnings.filterwarnings("ignore", category=UserWarning, module="torchaudio")
 
 
@@ -95,7 +96,7 @@ def calc_asr_wer_blue(target_audio_path, anonymized_audio_path, asr_model):
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-def process_reference(ref_file, model, output_dir, train_model, config):
+def process_reference(ref_file, model, output_dir, train_model, config, model_name, tts):
     """
     alpha: float, between 0 and 1, controls the degree of anonymization. 1 full anonymization (take style embedding of reference voice), 0 means take the style embedding from the target (the input audio we want to anonymize)\n
     style: str, one of 'target', 'mixing', 'half_and_half'. Determines the style of voice conversion.\n
@@ -115,17 +116,56 @@ def process_reference(ref_file, model, output_dir, train_model, config):
         target_path = os.path.join(targets_dir, target_file)
         target_speakers = os.listdir(target_path)
         target_speakers = [os.path.join(target_path, spk) for spk in target_speakers]
-        result = model.forward_from_audios_and_text(
-            'en',
-            text=get_whisper_text(target_speakers[0], asr_model),
-            target_sample=target_speakers[0],
-            ref_sample=ref_speakers,
-            train_model=train_model,
-            max_conditioning_length=config.model_args.max_conditioning_length,
-            min_conditioning_length=config.model_args.min_conditioning_length
-        )
+        anonymized_wav = None
+        if model_name == 'xtts2':
+            result = model.forward_from_audios_and_text(
+                'en',
+                text=get_whisper_text(target_speakers[0], asr_model),
+                target_sample=target_speakers[0],
+                ref_sample=ref_speakers,
+                train_model=train_model,
+                max_conditioning_length=config.model_args.max_conditioning_length,
+                min_conditioning_length=config.model_args.min_conditioning_length
+            )
+            anonymized_wav = result["wav"]
+        elif model_name == 'xtts2_segment_refinement_overlap_th_0_6':
+            anonymized_wav = iterative_segment_refinement(
+                model=model,                                    # Your XTTS model
+                target_speaker=target_speakers[0],              # Path to target speaker audio
+                ref_speaker=ref_speakers,                        # List of reference samples
+                max_conditioning_length=config.model_args.max_conditioning_length,
+                min_conditioning_length=config.model_args.min_conditioning_length,
+                train_model=train_model,                        # Your trained model
+                asr_model=asr_model,                           # Your ASR model
+                ecapa_model=ecapa2,                            # Your ECAPA model
+                lang='en',                                     # Language
+                threshold=0.6,                                 # Quality threshold (adjust as needed)
+                max_attempts=10
+            )
+        elif model_name == 'xtts2_forward_iterate':
+            result = model.forward_iteration(
+                lang='en',
+                text=get_whisper_text(target_speakers[0], asr_model),
+                target_sample=target_speakers[0],
+                ref_sample=ref_speakers[0],
+                train_model=train_model,
+                max_conditioning_length=config.model_args.max_conditioning_length,
+                min_conditioning_length=config.model_args.min_conditioning_length,
+                tts=tts,
+                asr_model=asr_model,
+                ecapa=ecapa2,
+            )
+            # get best audio based on quality scores
+            best = np.where(np.max(result[2])==result[2])[0][0]
+            anonymized_wav = result[3][best]
 
-        anonymized_wav = result["wav"]
+        if isinstance(anonymized_wav, torch.Tensor):
+            anonymized_wav = anonymized_wav.detach().cpu().numpy().squeeze()
+        elif isinstance(anonymized_wav, list):
+            anonymized_wav = np.array(anonymized_wav)
+        
+
+        #anonymized_wav = result["wav"]
         out_name = f"{os.path.splitext(ref_file)[0]}_to_{os.path.splitext(target_file)[0]}.wav"
         out_path = os.path.join(output_dir, out_name)
         sf.write(out_path, anonymized_wav, model.config.audio.output_sample_rate)
@@ -161,7 +201,7 @@ def main(model_name: str, output_dir: str = output_dir, name:str =f'{time.time()
     ref_files = os.listdir(references_dir)
     with ThreadPoolExecutor(max_workers=4) as executor:  # Adjust max_workers as needed
         futures = [
-            executor.submit(process_reference, ref_file, model,  output_dir, train_model, config)
+            executor.submit(process_reference, ref_file, model,  output_dir, train_model, config, model_name, tts)
             for ref_file in ref_files
         ]
         for future in tqdm.tqdm(as_completed(futures), total=len(futures), desc="References"):
@@ -173,4 +213,4 @@ def main(model_name: str, output_dir: str = output_dir, name:str =f'{time.time()
     tqdm.tqdm.write(f"Metadata saved to metadata_{model_name}_{name}.csv")
 
 if __name__ == "__main__":
-    main("xtts2", output_dir, name=f'{time.time()}_target_as_target_ref_as_ref_en')
+    main("xtts2_forward_iterate", output_dir, name=f'{time.time()}_target_as_target_ref_as_ref_en')

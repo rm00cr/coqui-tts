@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 import warnings
 
 from model_conf import ModelPaths, load_tts_and_trainer
-from development.utils import iterative_segment_refinement
+from development.utils import denoised_temp_file, iterative_segment_refinement
 warnings.filterwarnings("ignore", category=UserWarning, module="torchaudio")
 
 
@@ -142,19 +142,20 @@ def process_reference(ref_file, model, output_dir, train_model, config, model_na
                 threshold=0.6,                                 # Quality threshold (adjust as needed)
                 max_attempts=10
             )
-        elif model_name == 'xtts2_forward_iterate':
-            result = model.forward_iteration(
-                lang='en',
-                text=get_whisper_text(target_speakers[0], asr_model),
-                target_sample=target_speakers[0],
-                ref_sample=ref_speakers[0],
-                train_model=train_model,
-                max_conditioning_length=config.model_args.max_conditioning_length,
-                min_conditioning_length=config.model_args.min_conditioning_length,
-                tts=tts,
-                asr_model=asr_model,
-                ecapa=ecapa2,
-            )
+        elif model_name == 'xtts2_forward_iteration_denoise':
+            with denoised_temp_file(target_speakers[0]) as denoised_path:
+                result = model.forward_iteration(
+                    lang='en',
+                    text=get_whisper_text(target_speakers[0], asr_model),
+                    target_sample=denoised_path,
+                    ref_sample=ref_speakers[0],
+                    train_model=train_model,
+                    max_conditioning_length=config.model_args.max_conditioning_length,
+                    min_conditioning_length=config.model_args.min_conditioning_length,
+                    tts=tts,
+                    asr_model=asr_model,
+                    ecapa=ecapa2,
+                )
             # get best audio based on quality scores
             best = np.where(np.max(result[2])==result[2])[0][0]
             anonymized_wav = result[3][best]
@@ -213,4 +214,4 @@ def main(model_name: str, output_dir: str = output_dir, name:str =f'{time.time()
     tqdm.tqdm.write(f"Metadata saved to metadata_{model_name}_{name}.csv")
 
 if __name__ == "__main__":
-    main("xtts2_forward_iterate", output_dir, name=f'{time.time()}_target_as_target_ref_as_ref_en')
+    main("xtts2_forward_iteration_denoise", output_dir, name=f'{time.time()}_target_as_target_ref_as_ref_en')

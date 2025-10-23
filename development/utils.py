@@ -11,6 +11,8 @@ import uuid
 import threading
 import time
 from tqdm import tqdm
+import noisereduce as nr
+import librosa
 
 def split_audio(audio, segment_length_samples):
     segments = []
@@ -428,3 +430,75 @@ def resample_audio_16k(audio_tensor, orig_freq=24000, new_freq=16000):
     resampled = torchaudio.functional.resample(audio_tensor, orig_freq=orig_freq, new_freq=new_freq)
     return resampled
 
+
+
+def denoise_audio_to_temp(input_path):
+    """
+    Denoise audio and save to a temporary file
+    
+    Args:
+        input_path: Path to input audio file
+    
+    Returns:
+        str: Path to the temporary denoised audio file
+    """
+    # Load audio
+    waveform, sample_rate = torchaudio.load(input_path)
+
+    # Convert to mono if stereo
+    if waveform.shape[0] > 1:
+        waveform = waveform.mean(dim=0, keepdim=True)
+
+    audio_np = waveform.squeeze(0).numpy().astype(np.float32)
+
+    # --- Trim silence using librosa ---
+    trimmed, _ = librosa.effects.trim(audio_np, top_db=50)
+    audio_np = trimmed.astype(np.float32)
+
+    # --- Apply light denoising ---
+    reduced_noise = nr.reduce_noise(
+        y=audio_np,
+        sr=sample_rate,
+        stationary=False,
+        prop_decrease=0.7,
+        n_fft=1024
+    )
+
+    # Normalize
+    reduced_noise = reduced_noise / (np.max(np.abs(reduced_noise)) + 1e-6)
+
+    # --- Create temporary file - FIXED ---
+    temp_path = get_unique_temp_filename_for_denoising('_denoised.wav')
+    
+    # --- Save to temporary file ---
+    sf.write(temp_path, reduced_noise, sample_rate)
+    
+    return temp_path
+
+def get_unique_temp_filename_for_denoising(suffix='_denoised.wav'):
+    """Generate a unique temporary filename for denoising"""
+    timestamp = str(int(time.time() * 1000000))
+    thread_id = str(threading.get_ident())
+    unique_id = str(uuid.uuid4())[:8]
+    
+    temp_dir = tempfile.gettempdir()
+    filename = f"temp_{timestamp}_{thread_id}_{unique_id}{suffix}"
+    return os.path.join(temp_dir, filename)
+
+# Remove the duplicate definition at the end of your file
+# Keep only the original get_unique_temp_filename() function:
+# Add this to your utils.py file:
+
+from contextlib import contextmanager
+
+@contextmanager
+def denoised_temp_file(input_path):
+    """Context manager that automatically cleans up temporary denoised file"""
+    temp_path = denoise_audio_to_temp(input_path)
+    try:
+        yield temp_path
+    finally:
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass

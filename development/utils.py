@@ -284,7 +284,7 @@ def regenerate_segment_multiple_attempts(model, text_seg, segment_file, ref_spea
     
     return best_segment, best_quality, best_scores
 
-def iterative_segment_refinement(model, target_speaker, ref_speaker, max_conditioning_length, min_conditioning_length, train_model, asr_model, ecapa_model, lang='en', threshold=0.7, max_attempts=3):
+def iterative_segment_refinement(model, target_speaker, ref_speaker, max_conditioning_length, min_conditioning_length, train_model, asr_model, ecapa_model, lang='en', threshold=0.7, max_attempts=3,regenerate=False):
     # Step 1: Load target audio to get text and for embeddings
     target_audio = load_audio(target_speaker, 24000)
     text = asr_model.transcribe(target_speaker)['text']
@@ -393,6 +393,17 @@ def iterative_segment_refinement(model, target_speaker, ref_speaker, max_conditi
     tqdm.write(f"  - Total regeneration attempts: {total_attempts}")
     
     final_audio = stitch_segments_with_crossfade(refined_segments)
+
+
+
+    if regenerate:
+        temp_filename = get_unique_temp_filename('.wav')
+        sf.write(temp_filename, final_audio, 24000)
+        final_audio = model.forward_from_audios_and_text(
+        lang, text, temp_filename, ref_speaker[0], 
+        train_model, max_conditioning_length, min_conditioning_length
+        )
+
     tqdm.write(f"  - Final audio length: {final_audio.shape[-1] / 24000:.2f} seconds")
     
     return final_audio

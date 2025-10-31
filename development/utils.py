@@ -194,7 +194,7 @@ def stitch_segments_with_crossfade(segments):
     
     return torch.tensor(result)
 
-def generate_text_segments_with_whisper(asr_model, segments, sample_rate=24000):
+def generate_text_segments_with_whisper(asr_model, segments, sample_rate=24000, debug=False):
     """Generate text segments by transcribing each audio segment individually"""
     text_segments = []
     
@@ -212,16 +212,18 @@ def generate_text_segments_with_whisper(asr_model, segments, sample_rate=24000):
             os.unlink(temp_filename)
             
             text_segments.append(transcribed.strip())
-            tqdm.write(f"Segment {i} text: '{transcribed.strip()}'")
+            if debug:
+                tqdm.write(f"Segment {i} text: '{transcribed.strip()}'")
             
         except Exception as e:
-            tqdm.write(f"Failed to transcribe segment {i}: {e}")
+            if debug:
+                tqdm.write(f"Failed to transcribe segment {i}: {e}")
             # Fallback: use a generic text or empty string
             text_segments.append(f"segment {i}")
     
     return text_segments
 
-def regenerate_segment_multiple_attempts(model, text_seg, segment_file, ref_speaker, train_model, max_conditioning_length, min_conditioning_length, target_speaker_emb, ref_speaker_emb, asr_model, ecapa_model, lang='en', max_attempts=3, target_threshold=0.8):
+def regenerate_segment_multiple_attempts(model, text_seg, segment_file, ref_speaker, train_model, max_conditioning_length, min_conditioning_length, target_speaker_emb, ref_speaker_emb, asr_model, ecapa_model, lang='en', max_attempts=3, target_threshold=0.8,debug=False):
     """Regenerate a segment multiple times and choose the best one"""
     
     best_segment = None
@@ -230,8 +232,9 @@ def regenerate_segment_multiple_attempts(model, text_seg, segment_file, ref_spea
     current_segment_file = segment_file  # Track the current input file
     temp_files_created = []  # Track temp files for cleanup
     
-    tqdm.write(f"    Attempting {max_attempts} progressive regenerations...")
-    
+    if debug:
+        tqdm.write(f"    Attempting {max_attempts} progressive regenerations...")
+
     for attempt in range(max_attempts):
         try:
             # Regenerate segment using the current best as input
@@ -253,8 +256,9 @@ def regenerate_segment_multiple_attempts(model, text_seg, segment_file, ref_spea
             )
             
             current_quality = quality_info['overall_quality']
-            tqdm.write(f"      Attempt {attempt + 1}: Quality={current_quality:.3f}, WER={quality_info['wer']:.3f}, BLEU={quality_info['blue']:.3f}, RefSim={quality_info['ref_sim']:.3f}")
-            
+            if debug:
+                tqdm.write(f"      Attempt {attempt + 1}: Quality={current_quality:.3f}, WER={quality_info['wer']:.3f}, BLEU={quality_info['blue']:.3f}, RefSim={quality_info['ref_sim']:.3f}")
+
             # Keep if it's the best so far
             if current_quality > best_quality:
                 best_segment = candidate_segment
@@ -263,18 +267,22 @@ def regenerate_segment_multiple_attempts(model, text_seg, segment_file, ref_spea
                 
                 # Update the input file for next iteration to build upon this improvement
                 current_segment_file = attempt_file
-                tqdm.write(f"        → New best! Using this as input for next attempt")
-                
+                if debug:
+                    tqdm.write(f"        → New best! Using this as input for next attempt")
+
                 # Early stopping if we reach target threshold
                 if current_quality >= target_threshold:
-                    tqdm.write(f"      ✓ Target quality reached on attempt {attempt + 1}!")
+                    if debug:
+                        tqdm.write(f"      ✓ Target quality reached on attempt {attempt + 1}!")
                     break
             else:
-                tqdm.write(f"        → No improvement, keeping previous best as input")
+                if debug:
+                    tqdm.write(f"        → No improvement, keeping previous best as input")
                 # Don't update current_segment_file, keep using the best one
                 
         except Exception as e:
-            tqdm.write(f"      Attempt {attempt + 1} failed: {e}")
+            if debug:
+                tqdm.write(f"      Attempt {attempt + 1} failed: {e}")
             continue
     
     # Clean up temporary files
@@ -286,14 +294,14 @@ def regenerate_segment_multiple_attempts(model, text_seg, segment_file, ref_spea
     
     return best_segment, best_quality, best_scores
 
-def iterative_segment_refinement(model, target_speaker, ref_speaker, max_conditioning_length, min_conditioning_length, train_model, asr_model, ecapa_model, lang='en', threshold=0.7, max_attempts=3,regenerate=False):
+def iterative_segment_refinement(model, target_speaker, ref_speaker, max_conditioning_length, min_conditioning_length, train_model, asr_model, ecapa_model, lang='en', threshold=0.7, max_attempts=3,regenerate=False,debug=False):
     # Step 1: Load target audio to get text and for embeddings
     target_audio = load_audio(target_speaker, 24000)
     text = asr_model.transcribe(target_speaker)['text']
     
     # Generate full audio using file paths
     wav = model.forward_from_audios_and_text(
-        lang, text, target_speaker, ref_speaker[0], 
+        lang, text, target_speaker, ref_speaker, 
         train_model, max_conditioning_length, min_conditioning_length
     )
     
@@ -310,15 +318,17 @@ def iterative_segment_refinement(model, target_speaker, ref_speaker, max_conditi
     
     target_speaker_emb = ecapa_model(target_audio_16k.to("cuda"))
     ref_speaker_emb = ecapa_model(ref_audio_16k.to("cuda"))
-    
-    # Step 2: Split into 2-second segments
+
+    # Step 2: Split into 3-second segments
     segment_length = 2 * 24000
     segments = split_audio(audio_tensor, segment_length)
-    tqdm.write("Generating text segments with Whisper...")
+    if debug:
+        tqdm.write("Generating text segments with Whisper...")
     text_segments = generate_text_segments_with_whisper(asr_model, segments, 24000)
     
-    tqdm.write(f"Original audio length: {audio_tensor.shape[-1] / 24000:.2f} seconds")
-    tqdm.write(f"Number of segments: {len(segments)}")
+    if debug:
+        tqdm.write(f"Original audio length: {audio_tensor.shape[-1] / 24000:.2f} seconds")
+        tqdm.write(f"Number of segments: {len(segments)}")
     
     # Step 3: Assess each segment
     refined_segments = []
@@ -338,16 +348,17 @@ def iterative_segment_refinement(model, target_speaker, ref_speaker, max_conditi
         quality_info = assess_segment_quality(
             audio_seg, text_seg, target_speaker_emb, ref_speaker_emb, asr_model, ecapa_model
         )
-        
-        tqdm.write(f"Segment {i}: Text='{text_seg[:50]}{'...' if len(text_seg) > 50 else ''}'")
-        tqdm.write(f"  Original Quality={quality_info['overall_quality']:.3f}, WER={quality_info['wer']:.3f}, BLEU={quality_info['blue']:.3f}, RefSim={quality_info['ref_sim']:.3f}")
+        if debug:
+            tqdm.write(f"Segment {i}: Text='{text_seg[:50]}{'...' if len(text_seg) > 50 else ''}'")
+            tqdm.write(f"  Original Quality={quality_info['overall_quality']:.3f}, WER={quality_info['wer']:.3f}, BLEU={quality_info['blue']:.3f}, RefSim={quality_info['ref_sim']:.3f}")
         
         if quality_info['overall_quality'] < threshold:  # Bad segment
-            tqdm.write(f"  🔄 Refining segment {i} (quality below {threshold})")
+            if debug:
+                tqdm.write(f"  🔄 Refining segment {i} (quality below {threshold})")
             
             # Try multiple regenerations
             best_segment, best_quality, best_scores = regenerate_segment_multiple_attempts(
-                model, text_seg, segment_file, ref_speaker[0], 
+                model, text_seg, segment_file, ref_speaker, 
                 train_model, max_conditioning_length, min_conditioning_length,
                 target_speaker_emb, ref_speaker_emb, asr_model, ecapa_model,
                 lang, max_attempts, target_threshold=0.8
@@ -359,26 +370,32 @@ def iterative_segment_refinement(model, target_speaker, ref_speaker, max_conditi
                 # Trim/pad to original length
                 if best_segment.shape[-1] > original_seg_length:
                     best_segment = best_segment[..., :original_seg_length]
-                    tqdm.write(f"    Trimmed to {original_seg_length/24000:.2f}s")
+                    if debug:
+                        tqdm.write(f"    Trimmed to {original_seg_length/24000:.2f}s")
                 elif best_segment.shape[-1] < original_seg_length:
                     padding = original_seg_length - best_segment.shape[-1]
                     best_segment = torch.nn.functional.pad(best_segment, (0, padding))
-                    tqdm.write(f"    Padded to {original_seg_length/24000:.2f}s")
+                    if debug:
+                        tqdm.write(f"    Padded to {original_seg_length/24000:.2f}s")
                 
                 improvement = best_quality - quality_info['overall_quality']
                 if improvement > 0:
-                    tqdm.write(f"    ✓ Improved by {improvement:.3f} (final quality: {best_quality:.3f})")
+                    if debug:
+                        tqdm.write(f"    ✓ Improved by {improvement:.3f} (final quality: {best_quality:.3f})")
                     segments_improved += 1
                     refined_segments.append(best_segment)
                 else:
-                    tqdm.write(f"    ⚠️ No improvement (keeping original)")
+                    if debug:
+                        tqdm.write(f"    ⚠️ No improvement (keeping original)")
                     refined_segments.append(audio_seg)
             else:
-                tqdm.write(f"    ❌ All attempts failed (keeping original)")
+                if debug:
+                    tqdm.write(f"    ❌ All attempts failed (keeping original)")
                 refined_segments.append(audio_seg)
                 
         else:  # Good segment - keep as is
-            tqdm.write(f"  ✓ Good quality (keeping original)")
+            if debug:
+                tqdm.write(f"  ✓ Good quality (keeping original)")
             refined_segments.append(audio_seg)
     
     # Clean up all temp files
@@ -389,10 +406,11 @@ def iterative_segment_refinement(model, target_speaker, ref_speaker, max_conditi
             pass
     
     # Step 4: Stitch back together
-    tqdm.write(f"\n📊 Summary:")
-    tqdm.write(f"  - Segments processed: {len(segments)}")
-    tqdm.write(f"  - Segments improved: {segments_improved}")
-    tqdm.write(f"  - Total regeneration attempts: {total_attempts}")
+    if debug:
+        tqdm.write(f"\n📊 Summary:")
+        tqdm.write(f"  - Segments processed: {len(segments)}")
+        tqdm.write(f"  - Segments improved: {segments_improved}")
+        tqdm.write(f"  - Total regeneration attempts: {total_attempts}")
     
     final_audio = stitch_segments_with_crossfade(refined_segments)
 
@@ -402,11 +420,12 @@ def iterative_segment_refinement(model, target_speaker, ref_speaker, max_conditi
         temp_filename = get_unique_temp_filename('.wav')
         sf.write(temp_filename, final_audio, 24000)
         final_audio = model.forward_from_audios_and_text(
-        lang, text, temp_filename, ref_speaker[0], 
+        lang, text, temp_filename, ref_speaker, 
         train_model, max_conditioning_length, min_conditioning_length
         )
+        final_audio = final_audio["wav"]
+        os.unlink(temp_filename)
 
-    tqdm.write(f"  - Final audio length: {final_audio.shape[-1] / 24000:.2f} seconds")
     
     return final_audio
 

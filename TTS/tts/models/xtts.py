@@ -969,11 +969,11 @@ class Xtts(BaseTTS):
             tts,
             ecapa,
             asr_model,
-            n = 10):
+            n = 5):
 
         # for score calculation pre calculate target and ref embeddings
         target_audio = self.resample_audio_16k(target_sample)
-        ref_audio = self.resample_audio_16k(ref_sample)
+        ref_audio = self.resample_audio_16k(ref_sample[0])
         ref_emb = ecapa(ref_audio.to(device=self.device))
         tar_emb = ecapa(target_audio.to(device=self.device))
         smoothie = SmoothingFunction().method4

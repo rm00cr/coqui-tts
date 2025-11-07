@@ -79,13 +79,13 @@ def process_references(ref_file: str, target_dir: str, output_dir: str):
         target_speakers = [os.path.join(target_path, spk) for spk in target_speakers]
 
         lang = target_speaker_folder.split('_')[0]
-        if lang != ref_lang:
+        """if lang != ref_lang:
             continue  # skip if languages do not match
-
+        """
         similarity = calc_speaker_similarity(ref_speakers, target_speakers)
         tqdm.tqdm.write(f"Speaker similarity for {ref_file} and {target_speaker_folder}: {similarity}")
         metadata.append({
-            "language": ref_lang,
+            "language": lang,
             "reference_file": ref_file,
             "target_file": target_speaker_folder,
             "speaker_similarity": similarity,
@@ -114,4 +114,4 @@ def main(csv_name: str, output_dir: str = output_dir, name:str =f'{time.time()}'
     tqdm.tqdm.write(f"Metadata saved to {csv_name}.csv")
 
 if __name__ == "__main__":
-    main("cosine_sim_ref_target", output_dir, name=f'{time.time()}')
+    main("cosine_sim_ref_target_large", output_dir, name=f'{time.time()}')

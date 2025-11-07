@@ -162,8 +162,6 @@ def resample_audio(input_path, target_sr=16000):
     return audio
 
 def calc_speaker_similarity(ref_audio_path, anonymized_audio_path):
-
-
     ref_embedding = get_speaker_embedding(ref_audio_path).to(device)
     anonymized_embedding = get_speaker_embedding(anonymized_audio_path).to(device)
     # Compute cosine similarity
@@ -359,11 +357,17 @@ def process_reference(ref_file, model, output_dir, train_model, config, model_na
         })
         # ADD THIS: Mark this pair as completed and save checkpoint
         pair_id = f"{ref_file}_{target_speaker_folder}"
-
-        checkpoint = load_checkpoint(checkpoint_path)  # Reload fresh state
-        checkpoint["completed"].append(pair_id)
-        checkpoint["metadata"].append(local_metadata[-1])  # Use append, not extend
-        save_checkpoint_with_file_lock(checkpoint_path, checkpoint["completed"], checkpoint["metadata"])
+        # dont just fail the whole process if file already open
+        while True:
+            try:
+                checkpoint = load_checkpoint(checkpoint_path)  # Reload fresh state
+                checkpoint["completed"].append(pair_id)
+                checkpoint["metadata"].append(local_metadata[-1])  # Use append, not extend
+                save_checkpoint_with_file_lock(checkpoint_path, checkpoint["completed"], checkpoint["metadata"])
+                break  # Exit loop if successful
+            except Exception as e:
+                tqdm.tqdm.write(f"Error loading checkpoint: {e}")
+                time.sleep(30)  # Wait before retrying
     return local_metadata
 
 def main(model_name: str, output_dir: str = output_dir, name:str =f'{time.time()}'):

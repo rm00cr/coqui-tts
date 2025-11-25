@@ -18,6 +18,7 @@ from TTS.tts.models.base_tts import BaseTTS
 from TTS.utils.io import load_fsspec
 from jiwer import wer
 from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
+import h5py
 
 
 init_stream_support()
@@ -71,11 +72,15 @@ def wav_to_mel_cloning(
     return mel
 
 
-def load_audio(audiopath, sampling_rate):
+def load_audio(audiopath, sampling_rate,hdf5_path=None):
     # better load setting following: https://github.com/faroit/python_audio_loading_benchmark
 
     # torchaudio should chose proper backend to load audio depending on platform
-    audio, lsr = torchaudio.load(audiopath)
+    if hdf5_path is not None:
+        audio = load_audio_hdf5(hdf5_path, audiopath)
+        lsr = sampling_rate
+    else:
+        audio, lsr = torchaudio.load(audiopath)
 
     # stereo to mono if needed
     if audio.size(0) != 1:
@@ -92,6 +97,11 @@ def load_audio(audiopath, sampling_rate):
     audio.clip_(-1, 1)
     return audio
 
+def load_audio_hdf5(hdf5_path, file_key):
+        with h5py.File(hdf5_path, "r") as hdf5_file:
+            audio = hdf5_file[file_key][:]
+        audio_tensor = torch.FloatTensor(audio)
+        return audio_tensor
 
 def pad_or_truncate(t, length):
     """
@@ -904,18 +914,22 @@ class Xtts(BaseTTS):
         batch["padded_text"] = text_padded
         return batch
     
+    
     def prep_batch(self, lang,
         text,
         target_sample,
         ref_sample,
         train_model,
         max_conditioning_length,
-        min_conditioning_length
+        min_conditioning_length,
+        hdf5_path=None
         ):
         from TTS.tts.layers.xtts.trainer.dataset import get_prompt_slice
         device = self.device 
-
-        wav = load_audio(target_sample, 22050)
+        if hdf5_path is not None:
+            wav = load_audio_hdf5(target_sample, 22050,hdf5_path=hdf5_path)
+        else:
+            wav = load_audio(target_sample, 22050)
         tokens = self.tokenizer.encode(text, lang)#train_model.xtts.tokenizer.encode(text, lang)
         tseq = torch.IntTensor(tokens)
 
@@ -1040,30 +1054,155 @@ class Xtts(BaseTTS):
                 )
 
                 audio_codes.append(o["audio_codes"])
-                """new_audio_code = self.weighted_audio_codes(
-                    audio_codes=audio_codes,
-                    bleu_scores=save_scores["blue_scores"],
-                    wer_scores=save_scores["wer_scores"],
-                    target_cosines=save_scores["target_cosine_similarities"],
-                    reference_cosines=save_scores["reference_cosine_similarities"]
-                )
-                o["audio_codes"] = new_audio_code.round().long() 
-                num_embeddings = self.gpt.mel_embedding.num_embeddings
-                o["audio_codes"] = o["audio_codes"].clamp(0, num_embeddings - 1)"""
-
 
         return save_wavs, save_scores, quality_scores, audios
+    
+    @torch.no_grad()
+    def forward_iteration_hdf5(self, lang,
+            text,
+            target_sample,
+            ref_sample,
+            train_model,
+            max_conditioning_length,
+            min_conditioning_length,
+            tts,
+            ecapa,
+            asr_model,
+            hdf5_path,
+            n = 5):
+        
+        # for score calculation pre calculate target and ref embeddings
+        target_audio = self.resample_audio_16k(target_sample, hdf5_path=hdf5_path)
+        ref_audio = self.resample_audio_16k(ref_sample[0], hdf5_path=hdf5_path)
+        ref_emb = ecapa(ref_audio.to(device=self.device))
+        tar_emb = ecapa(target_audio.to(device=self.device))
+        smoothie = SmoothingFunction().method4
 
-    def resample_audio_16k(self, audiopath,new_freq=16000):
+        o = self.prep_batch(
+            lang,
+            text,
+            target_sample,
+            ref_sample,
+            train_model,
+            max_conditioning_length,
+            min_conditioning_length,
+            hdf5_path=hdf5_path
+        )
+
+        save_wavs = {}
+        save_scores = {"blue_scores": [], "wer_scores": [], "target_cosine_similarities": [], "reference_cosine_similarities": []}
+        audio_codes = []
+        quality_scores = []
+        audios = []
+        
+        import tempfile
+        import time
+        temp_hdf5_path = os.path.join(tempfile.gettempdir(), f"iter_temp_{os.getpid()}_{int(time.time())}.hdf5")
+
+        try:
+            for i in range(0, n):
+                wav = self.forward(o, ref_sample, train_model)
+                
+                # Ensure file handle is properly closed by using context manager
+                with h5py.File(temp_hdf5_path, 'a') as hdf5_temp:
+                    iter_key = f'iteration_{i}'
+                    if iter_key in hdf5_temp:
+                        del hdf5_temp[iter_key]
+                    hdf5_temp.create_dataset(iter_key, data=wav['wav'])
+                    hdf5_temp[iter_key].attrs['sr'] = 24000
+                # File is closed here
+                    
+                save_wavs[f"wav_{i}"] = f"{temp_hdf5_path}:{iter_key}"
+
+                temp_asr_file = f"/tmp/asr_temp_{i}_{os.getpid()}.wav"
+                import soundfile as sf
+                sf.write(temp_asr_file, wav['wav'], 24000)
+                
+                try:
+                    generated_text = asr_model.transcribe(temp_asr_file)["text"].lower()
+                finally:
+                    try:
+                        os.unlink(temp_asr_file)
+                    except OSError:
+                        pass
+                
+                blue_score = sentence_bleu([text.lower().split()], generated_text.split(), smoothing_function=smoothie)
+                wer_score = wer(reference=text.lower(), hypothesis=generated_text)
+                save_scores["blue_scores"].append(blue_score)
+                save_scores["wer_scores"].append(wer_score)
+
+                # compute cosine similarities
+                synth_audio = torch.tensor(wav['wav']).unsqueeze(0).float()
+                if synth_audio.dim() == 1:
+                    synth_audio = synth_audio.unsqueeze(0)
+
+                synth_audio_16k = torchaudio.functional.resample(synth_audio, orig_freq=24000, new_freq=16000)
+                synth_emb = ecapa(synth_audio_16k.to(device=self.device))
+                save_scores["target_cosine_similarities"].append(torch.cosine_similarity(tar_emb, synth_emb))
+                save_scores["reference_cosine_similarities"].append(torch.cosine_similarity(ref_emb, synth_emb))
+                print(f"Iteration {i}: BLUE: {blue_score}, WER: {wer_score}, Target Cosine: {save_scores['target_cosine_similarities'][-1]}, Reference Cosine: {save_scores['reference_cosine_similarities'][-1]}")
+                
+                quality_score = (
+                    0.05 * (1 - wer_score) +
+                    0.05 * blue_score +
+                    0.30 * (1 - save_scores["target_cosine_similarities"][-1]) +
+                    0.60 * save_scores["reference_cosine_similarities"][-1]
+                )
+                quality_scores.append(quality_score.item())
+                audios.append(wav['wav'])
+
+                # compute new audio codes for next iteration
+                if i < n - 1:
+                    o = self.prep_batch(
+                        lang,
+                        text,
+                        f'iteration_{i}',
+                        ref_sample,
+                        train_model,
+                        max_conditioning_length,
+                        min_conditioning_length,
+                        hdf5_path=temp_hdf5_path
+                    )
+                    audio_codes.append(o["audio_codes"])
+                    
+        finally:
+            # Robust cleanup
+            try:
+                if os.path.exists(temp_hdf5_path):
+                    os.unlink(temp_hdf5_path)
+                    print(f"Cleaned up temp HDF5 file: {temp_hdf5_path}")
+            except OSError as e:
+                print(f"Warning: Could not delete temp HDF5 file {temp_hdf5_path}: {e}")
+                
+        return save_wavs, save_scores, quality_scores, audios
+
+    def resample_audio_16k(self, audiopath,new_freq=16000,hdf5_path=None, orig_freq=22050):
         """Resample the given audio to 16kHz.
         Args:
             audiopath (str): Path to the audio file.
         Returns:
             Resampled audio tensor at 16kHz.
         """
-        ref_audio, sr = torchaudio.load(audiopath)
-        ref_audio = torchaudio.functional.resample(ref_audio, orig_freq=sr, new_freq=new_freq)
-        return ref_audio
+        # if h5py path is given load from hdf5 file
+        if hdf5_path is not None:
+            with h5py.File(hdf5_path, 'r') as hdf5_file:
+                ref_audio = torch.tensor(hdf5_file[audiopath][:])
+                # Try to get sample rate from attributes, otherwise use orig_freq parameter
+                if 'sr' in hdf5_file[audiopath].attrs:
+                    orig_freq = hdf5_file[audiopath].attrs['sr']
+            
+            # Ensure it's 2D for resampling
+            if ref_audio.dim() == 1:
+                ref_audio = ref_audio.unsqueeze(0)
+            ref_audio = torchaudio.functional.resample(ref_audio, orig_freq=orig_freq, new_freq=new_freq)
+            return ref_audio
+        else:
+            ref_audio, sr = torchaudio.load(audiopath)
+            # Ensure it's 2D for resampling
+            if ref_audio.dim() == 1:
+                ref_audio = ref_audio.unsqueeze(0)
+            ref_audio = torchaudio.functional.resample(ref_audio, orig_freq=sr, new_freq=new_freq)
+            return ref_audio
     
     def weighted_audio_codes(self,audio_codes, bleu_scores, wer_scores, target_cosines, reference_cosines):
         # Convert scores to tensors

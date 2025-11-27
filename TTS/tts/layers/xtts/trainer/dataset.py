@@ -30,8 +30,10 @@ def key_samples_by_col(samples, col):
     return samples_by_col
 
 
-def get_prompt_slice(gt_path, max_sample_length, min_sample_length, sample_rate, is_eval=False):
-    if isinstance(gt_path, str):
+def get_prompt_slice(gt_path, max_sample_length, min_sample_length, sample_rate, is_eval=False,hdf5_path=None):
+    if hdf5_path is not None:
+        rel_clip = load_audio(gt_path, sample_rate, hdf5_path)
+    elif isinstance(gt_path, str):
         rel_clip = load_audio(gt_path, sample_rate)
     else:
         rel_clip = torch.clone(gt_path)
@@ -44,6 +46,8 @@ def get_prompt_slice(gt_path, max_sample_length, min_sample_length, sample_rate,
     if gap < 0:
         sample_length = rel_clip.shape[-1] // 2
     gap = rel_clip.shape[-1] - sample_length
+    if rel_clip.dim() == 1:
+        rel_clip = rel_clip.unsqueeze(0)
 
     # if eval start always from the position 0 to be more reproducible
     if is_eval:
@@ -125,9 +129,7 @@ class XTTSDataset(torch.utils.data.Dataset):
         tseq = self.get_text(text, sample["language"])
         audiopath = sample["audio_file"]
         if self.config.use_h5:
-            # combined somewhere to dataset_name#audiofile name
-            dataset_name = sample["audio_unique_name"].split('#')[0]
-
+            dataset_name = sample["dataset_name"]
             with h5py.File(self.h5_paths[dataset_name], "r") as h5_file:
                 wav = h5_file[audiopath][...]  # I put just the sample name in audio file, should be ok
                 wav = torch.tensor(wav[None, :], dtype=torch.float)
@@ -135,6 +137,9 @@ class XTTSDataset(torch.utils.data.Dataset):
                     wav = torchaudio.functional.resample(wav, H5_SAMPLE_RATE, self.sample_rate)
         else:
             wav = load_audio(audiopath, self.sample_rate)
+        if wav.dim() == 1:
+            wav = wav.unsqueeze(0)  
+
         if text is None or len(text.strip()) == 0 or len(text) >= self.max_text_len:
             # max length len may be the case on erroneous samples with transcription, e.g. "la la la la la la la ..."
             raise ValueError

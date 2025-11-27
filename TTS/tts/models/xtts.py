@@ -72,18 +72,23 @@ def wav_to_mel_cloning(
     return mel
 
 
-def load_audio(audiopath, sampling_rate,hdf5_path=None):
+def load_audio(audiopath, sampling_rate,hdf5_path=None,original_sr=None):
     # better load setting following: https://github.com/faroit/python_audio_loading_benchmark
 
     # torchaudio should chose proper backend to load audio depending on platform
     if hdf5_path is not None:
         audio = load_audio_hdf5(hdf5_path, audiopath)
-        lsr = sampling_rate
+        if original_sr is not None:
+            lsr = original_sr
+        else:
+            lsr = sampling_rate
     else:
         audio, lsr = torchaudio.load(audiopath)
 
     # stereo to mono if needed
-    if audio.size(0) != 1:
+    if audio.dim() == 1:
+        audio = audio.unsqueeze(0)
+    elif audio.size(0) != 1:
         audio = torch.mean(audio, dim=0, keepdim=True)
 
     if lsr != sampling_rate:
@@ -347,6 +352,7 @@ class Xtts(BaseTTS):
         librosa_trim_db=None,
         sound_norm_refs=False,
         load_sr=22050,
+        hdf5_path=None
     ):
         """Get the conditioning latents for the GPT model from the given audio.
 
@@ -369,7 +375,7 @@ class Xtts(BaseTTS):
         audios = []
         speaker_embedding = None
         for file_path in audio_paths:
-            audio = load_audio(file_path, load_sr)
+            audio = load_audio(file_path, load_sr, hdf5_path=hdf5_path)
             audio = audio[:, : load_sr * max_ref_length].to(self.device)
             if sound_norm_refs:
                 audio = (audio / torch.abs(audio).max()) * 0.75
@@ -834,7 +840,7 @@ class Xtts(BaseTTS):
         return wav_audio_codes
 
 
-    def forward(self, o, ref_sample, train_model):
+    def forward(self, o, ref_sample, train_model, ref_hdf5_path=None):
         device = self.device
 
         cond_mels = o["cond_mels"].to(device)
@@ -853,6 +859,7 @@ class Xtts(BaseTTS):
                 gpt_cond_chunk_len=15,
                 max_ref_length=45,
                 sound_norm_refs=False,
+                hdf5_path=ref_hdf5_path if ref_hdf5_path is not None else None
             )
 
             gpt_latents = self.gpt(
@@ -922,14 +929,20 @@ class Xtts(BaseTTS):
         train_model,
         max_conditioning_length,
         min_conditioning_length,
-        hdf5_path=None
+        target_hdf5_path=None,
+        ref_hdf5_path=None,
+        target_sample_rate=22050
         ):
         from TTS.tts.layers.xtts.trainer.dataset import get_prompt_slice
         device = self.device 
-        if hdf5_path is not None:
-            wav = load_audio_hdf5(target_sample, 22050,hdf5_path=hdf5_path)
+        if target_hdf5_path is not None:
+            wav = load_audio(target_sample, target_sample_rate,hdf5_path=target_hdf5_path)
         else:
-            wav = load_audio(target_sample, 22050)
+            wav = load_audio(target_sample, target_sample_rate)
+        
+        if wav.dim() == 1:
+            wav = wav.unsqueeze(0)
+
         tokens = self.tokenizer.encode(text, lang)#train_model.xtts.tokenizer.encode(text, lang)
         tseq = torch.IntTensor(tokens)
 
@@ -937,7 +950,7 @@ class Xtts(BaseTTS):
             conds, cond_lens = [], []
             for ref in ref_sample:
                 cond, cond_len, _ = get_prompt_slice(
-                    ref, max_conditioning_length, min_conditioning_length, 22050, True
+                    ref, max_conditioning_length, min_conditioning_length, 22050, True, hdf5_path=ref_hdf5_path if ref_hdf5_path is not None else None
                 )
                 conds.append(cond)
                 cond_lens.append(cond_len)
@@ -946,7 +959,7 @@ class Xtts(BaseTTS):
             cond_len = int(sum(cond_lens) / len(cond_lens))
         else:
             cond, cond_len, _ = get_prompt_slice(
-                ref_sample, max_conditioning_length, min_conditioning_length, 22050, True
+                ref_sample, max_conditioning_length, min_conditioning_length, 22050, True, hdf5_path=ref_hdf5_path if ref_hdf5_path is not None else None
             )
 
         cond_idxs = torch.nan
@@ -1068,12 +1081,14 @@ class Xtts(BaseTTS):
             tts,
             ecapa,
             asr_model,
-            hdf5_path,
-            n = 5):
+            target_hdf5_path,
+            ref_hdf5_path,
+            n = 5,
+            ):
         
         # for score calculation pre calculate target and ref embeddings
-        target_audio = self.resample_audio_16k(target_sample, hdf5_path=hdf5_path)
-        ref_audio = self.resample_audio_16k(ref_sample[0], hdf5_path=hdf5_path)
+        target_audio = self.resample_audio_16k(target_sample, hdf5_path=target_hdf5_path)
+        ref_audio = self.resample_audio_16k(ref_sample if isinstance(ref_sample, str) else ref_sample[0], hdf5_path=ref_hdf5_path)
         ref_emb = ecapa(ref_audio.to(device=self.device))
         tar_emb = ecapa(target_audio.to(device=self.device))
         smoothie = SmoothingFunction().method4
@@ -1086,7 +1101,8 @@ class Xtts(BaseTTS):
             train_model,
             max_conditioning_length,
             min_conditioning_length,
-            hdf5_path=hdf5_path
+            target_hdf5_path=target_hdf5_path,
+            ref_hdf5_path=ref_hdf5_path
         )
 
         save_wavs = {}
@@ -1100,70 +1116,73 @@ class Xtts(BaseTTS):
         temp_hdf5_path = os.path.join(tempfile.gettempdir(), f"iter_temp_{os.getpid()}_{int(time.time())}.hdf5")
 
         try:
-            for i in range(0, n):
-                wav = self.forward(o, ref_sample, train_model)
-                
-                # Ensure file handle is properly closed by using context manager
-                with h5py.File(temp_hdf5_path, 'a') as hdf5_temp:
-                    iter_key = f'iteration_{i}'
-                    if iter_key in hdf5_temp:
-                        del hdf5_temp[iter_key]
-                    hdf5_temp.create_dataset(iter_key, data=wav['wav'])
-                    hdf5_temp[iter_key].attrs['sr'] = 24000
-                # File is closed here
+            
+                for i in range(0, n):
+                    wav = self.forward(o, ref_sample, train_model,ref_hdf5_path=ref_hdf5_path)
+
+                    # Ensure file handle is properly closed by using context manager
+                    with h5py.File(temp_hdf5_path, 'w') as hdf5_temp:
+                        iter_key = f'iteration_{i}'
+                        if iter_key in hdf5_temp:
+                            del hdf5_temp[iter_key]
+                        hdf5_temp.create_dataset(iter_key, data=wav['wav'])
+                        hdf5_temp[iter_key].attrs['sr'] = 24000
+                    # File is closed here
+                        
+                    save_wavs[f"wav_{i}"] = f"{temp_hdf5_path}:{iter_key}"
+
+                    temp_asr_file = f"/tmp/asr_temp_{i}_{os.getpid()}.wav"
+                    import soundfile as sf
+                    sf.write(temp_asr_file, wav['wav'], 24000)
                     
-                save_wavs[f"wav_{i}"] = f"{temp_hdf5_path}:{iter_key}"
-
-                temp_asr_file = f"/tmp/asr_temp_{i}_{os.getpid()}.wav"
-                import soundfile as sf
-                sf.write(temp_asr_file, wav['wav'], 24000)
-                
-                try:
-                    generated_text = asr_model.transcribe(temp_asr_file)["text"].lower()
-                finally:
                     try:
-                        os.unlink(temp_asr_file)
-                    except OSError:
-                        pass
-                
-                blue_score = sentence_bleu([text.lower().split()], generated_text.split(), smoothing_function=smoothie)
-                wer_score = wer(reference=text.lower(), hypothesis=generated_text)
-                save_scores["blue_scores"].append(blue_score)
-                save_scores["wer_scores"].append(wer_score)
+                        generated_text = asr_model.transcribe(temp_asr_file)["text"].lower()
+                    finally:
+                        try:
+                            os.unlink(temp_asr_file)
+                        except OSError:
+                            pass
+                    
+                    blue_score = sentence_bleu([text.lower().split()], generated_text.split(), smoothing_function=smoothie)
+                    wer_score = wer(reference=text.lower(), hypothesis=generated_text)
+                    save_scores["blue_scores"].append(blue_score)
+                    save_scores["wer_scores"].append(wer_score)
 
-                # compute cosine similarities
-                synth_audio = torch.tensor(wav['wav']).unsqueeze(0).float()
-                if synth_audio.dim() == 1:
-                    synth_audio = synth_audio.unsqueeze(0)
+                    # compute cosine similarities
+                    synth_audio = torch.tensor(wav['wav']).unsqueeze(0).float()
+                    if synth_audio.dim() == 1:
+                        synth_audio = synth_audio.unsqueeze(0)
 
-                synth_audio_16k = torchaudio.functional.resample(synth_audio, orig_freq=24000, new_freq=16000)
-                synth_emb = ecapa(synth_audio_16k.to(device=self.device))
-                save_scores["target_cosine_similarities"].append(torch.cosine_similarity(tar_emb, synth_emb))
-                save_scores["reference_cosine_similarities"].append(torch.cosine_similarity(ref_emb, synth_emb))
-                print(f"Iteration {i}: BLUE: {blue_score}, WER: {wer_score}, Target Cosine: {save_scores['target_cosine_similarities'][-1]}, Reference Cosine: {save_scores['reference_cosine_similarities'][-1]}")
-                
-                quality_score = (
-                    0.05 * (1 - wer_score) +
-                    0.05 * blue_score +
-                    0.30 * (1 - save_scores["target_cosine_similarities"][-1]) +
-                    0.60 * save_scores["reference_cosine_similarities"][-1]
-                )
-                quality_scores.append(quality_score.item())
-                audios.append(wav['wav'])
-
-                # compute new audio codes for next iteration
-                if i < n - 1:
-                    o = self.prep_batch(
-                        lang,
-                        text,
-                        f'iteration_{i}',
-                        ref_sample,
-                        train_model,
-                        max_conditioning_length,
-                        min_conditioning_length,
-                        hdf5_path=temp_hdf5_path
+                    synth_audio_16k = torchaudio.functional.resample(synth_audio, orig_freq=24000, new_freq=16000)
+                    synth_emb = ecapa(synth_audio_16k.to(device=self.device))
+                    save_scores["target_cosine_similarities"].append(torch.cosine_similarity(tar_emb, synth_emb))
+                    save_scores["reference_cosine_similarities"].append(torch.cosine_similarity(ref_emb, synth_emb))
+                    
+                    quality_score = (
+                        0.05 * (1 - wer_score) +
+                        0.05 * blue_score +
+                        0.30 * (1 - save_scores["target_cosine_similarities"][-1]) +
+                        0.60 * save_scores["reference_cosine_similarities"][-1]
                     )
-                    audio_codes.append(o["audio_codes"])
+                    quality_scores.append(quality_score.item())
+                    audios.append(wav['wav'])
+
+                    # compute new audio codes for next iteration
+                    if i < n - 1:
+                        target_sample_rate = 24000 if i > 0 else 22050
+                        o = self.prep_batch(
+                            lang,
+                            text,
+                            f'iteration_{i}',
+                            ref_sample,
+                            train_model,
+                            max_conditioning_length,
+                            min_conditioning_length,
+                            target_hdf5_path=temp_hdf5_path,
+                            ref_hdf5_path=ref_hdf5_path,
+                            target_sample_rate=target_sample_rate
+                        )
+                        audio_codes.append(o["audio_codes"])
                     
         finally:
             # Robust cleanup

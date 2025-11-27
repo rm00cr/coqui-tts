@@ -1,3 +1,4 @@
+import h5py
 import tqdm
 import os
 import pandas as pd
@@ -111,16 +112,16 @@ def is_pair_completed(ref_file, target_file, completed_pairs):
 caching functions
 """
 speaker_embedding_cache = {}
-def get_speaker_embedding(path):
+def get_speaker_embedding(audio_pointer,  orig_sr=22050,hdf5_path = None):
 
-    if isinstance(path, str) and path not in speaker_embedding_cache:
-        path_name = path
-        audio = resample_audio(path).to(device)
-        speaker_embedding_cache[path] = ecapa2(audio)
-    elif isinstance(path, list):
-        path_name = path[0].split('/')[-2]
+    if isinstance(audio_pointer, str) and audio_pointer not in speaker_embedding_cache:
+        path_name = audio_pointer
+        audio = resample_audio_hdf5(audio_pointer, hdf5_path,target_sr=16000, orig_sr=orig_sr).to(device) if hdf5_path is not None else resample_audio(audio_pointer, target_sr=orig_sr).to(device)
+        speaker_embedding_cache[audio_pointer] = ecapa2(audio)
+    elif isinstance(audio_pointer, list):
+        path_name = audio_pointer[0]
         if path_name not in speaker_embedding_cache:
-            audio = resample_audio(path).to(device)
+            audio = resample_audio_hdf5(audio_pointer, hdf5_path,target_sr=16000, orig_sr=orig_sr).to(device) if hdf5_path is not None else resample_audio(audio_pointer, target_sr=orig_sr).to(device)
             with torch.no_grad():
                     embedding = ecapa2(audio)
                     speaker_embedding_cache[path_name] = embedding
@@ -128,7 +129,7 @@ def get_speaker_embedding(path):
             if torch.cuda.is_available():
                     torch.cuda.empty_cache()
     else:
-        path_name = path
+        path_name = audio_pointer
     return speaker_embedding_cache[path_name]
 
 whisper_text_cache = {}
@@ -136,6 +137,42 @@ def get_whisper_text(audio_path, asr_model):
     if audio_path not in whisper_text_cache:
         whisper_text_cache[audio_path] = asr_model.transcribe(audio_path)["text"].lower()
     return whisper_text_cache[audio_path]
+
+def resample_audio_hdf5(store_id, hdf5_path, target_sr=16000,orig_sr=24000):
+    """Load and resample audio from HDF5 file"""
+    import h5py
+    
+    assert isinstance(store_id, (str, int, list)), "store_id must be string, int, or list"
+    
+    if isinstance(store_id, list):
+        long_audio = []
+        for sid in store_id:
+            with h5py.File(hdf5_path, 'r') as f:
+                audio_data = f[str(sid)][()]
+            audio = torch.tensor(audio_data).unsqueeze(0).float()
+            if audio.shape[0] == 1 and len(audio.shape) == 2:
+                pass  # already correct shape
+            elif len(audio.shape) == 1:
+                audio = audio.unsqueeze(0)
+            
+
+            if audio.shape[1] > 0:  # Check if not empty
+                audio = torchaudio.functional.resample(audio, orig_freq=orig_sr, new_freq=target_sr)
+            long_audio.append(audio)
+        
+        audio = torch.cat(long_audio, dim=1)
+        max_total_samples = target_sr * 60
+        if audio.shape[1] > max_total_samples:
+            audio = audio[:, :max_total_samples]
+    else:
+        with h5py.File(hdf5_path, 'r') as f:
+            audio_data = f[str(store_id)][()]
+        audio = torch.tensor(audio_data).unsqueeze(0).float()
+        if len(audio.shape) == 1:
+            audio = audio.unsqueeze(0)
+        audio = torchaudio.functional.resample(audio, orig_freq=orig_sr, new_freq=target_sr)
+    
+    return audio
 
 def resample_audio(input_path, target_sr=16000):
     assert type(input_path) in [str, list], "input_path must be a string or a list of strings"
@@ -156,26 +193,25 @@ def resample_audio(input_path, target_sr=16000):
             audio = audio[:, :max_total_samples]
     return audio
 
-def calc_speaker_similarity(ref_audio_path, anonymized_audio_path):
-    ref_embedding = get_speaker_embedding(ref_audio_path).to(device)
+def calc_speaker_similarity(ref_audio_path, ref_sr, anonymized_audio_path,ref_path):
+    ref_embedding = get_speaker_embedding(ref_audio_path, ref_sr,hdf5_path=ref_path).to(device)
     anonymized_embedding = get_speaker_embedding(anonymized_audio_path).to(device)
     # Compute cosine similarity
     with torch.no_grad():
         similarity = torch.cosine_similarity(ref_embedding, anonymized_embedding)
         return similarity.item()
 
-def calc_asr_wer_blue(target_audio_path, anonymized_audio_path, asr_model):
+def calc_asr_wer_blue(anonymized_audio_path, target_text,asr_model):
     if asr_model is None:
         tqdm.write('ASR model not available')
         return None, None
 
     else:
         # Use Whisper ASR output for both audios
-        ref_transcription = get_whisper_text(target_audio_path, asr_model)
         anon_transcription = get_whisper_text(anonymized_audio_path, asr_model)
 
-        bleu_score = sentence_bleu([ref_transcription.split()], anon_transcription.split(), smoothing_function=smoothie)
-        wer_score = wer(ref_transcription, anon_transcription)
+        bleu_score = sentence_bleu([target_text.lower().split()], anon_transcription.lower().split(), smoothing_function=smoothie)
+        wer_score = wer(target_text, anon_transcription)
 
         return wer_score, bleu_score
 
@@ -217,9 +253,11 @@ def segment_quality_score(asr_model, target_speaker_emb, ref_speaker_emb, anonym
     return quality_score, quality_infos
 
 
+
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-def process_reference(ref_file, model, output_dir, train_model, config, model_name, tts, checkpoint_path):
+
+def process_reference(ref_speaker_id, model, output_dir, train_model, config, model_name, tts, checkpoint_path, df_ref, df_target, ref_hdf5_path, target_hdf5_path):
     """
     alpha: float, between 0 and 1, controls the degree of anonymization. 1 full anonymization (take style embedding of reference voice), 0 means take the style embedding from the target (the input audio we want to anonymize)\n
     style: str, one of 'target', 'mixing', 'half_and_half'. Determines the style of voice conversion.\n
@@ -232,103 +270,129 @@ def process_reference(ref_file, model, output_dir, train_model, config, model_na
     # get whisper
     asr_model = whisper.load_model("base", device="cuda" if torch.cuda.is_available() else "cpu")
     
-    ref_path = os.path.join(references_dir, ref_file)
-    ref_speakers = os.listdir(ref_path)
-    ref_lang = ref_file.split('_')[0]
+    ref_store_ids = df_ref.store_id[df_ref.speaker_id == ref_speaker_id].tolist()
+    ref_lang = df_ref.lang[df_ref.speaker_id == ref_speaker_id].iloc[0]
 
-    ref_speakers = [os.path.join(ref_path, spk) for spk in ref_speakers]
+
     local_metadata = []
 
-    for target_speaker_folder in tqdm.tqdm(os.listdir(targets_dir), leave=False, desc=f"{ref_file} targets"):
-        if is_pair_completed(ref_file, target_speaker_folder, checkpoint["completed"]):
-            tqdm.tqdm.write(f"Skipping {ref_file} -> {target_speaker_folder} (already completed)")
+    # get all speakers for the targets
+    target_speaker_ids = df_target.speaker_id.unique()
+
+    for target_speaker_id in tqdm.tqdm(target_speaker_ids, desc=f"{ref_speaker_id} targets"):
+        if is_pair_completed(ref_speaker_id, target_speaker_id, checkpoint["completed"]):
+            tqdm.tqdm.write(f"Skipping {ref_speaker_id} -> {target_speaker_id} (already completed)")
             continue
-        target_path = os.path.join(targets_dir, target_speaker_folder)
-        target_speakers = os.listdir(target_path)
-        target_speakers = [os.path.join(target_path, spk) for spk in target_speakers]
+
+
+        target_store_ids = df_target.store_id[df_target.speaker_id == target_speaker_id].iloc[0]
         
         anonymized_wav = None
 
-        lan = target_speaker_folder.split('_')[0]
+        lan = df_target.lang[df_target.speaker_id == target_speaker_id].iloc[0]
         if lan != ref_lang:
             continue  # skip if languages do not match
-        """
 
-        if target_speakers[0] in ref_speakers:
-            continue  # skip if target is same as reference """
+        if target_speaker_id == ref_speaker_id:
+            continue  # skip if target is same as reference 
 
         if model_name == 'xtts2_forward_iteration':
             #with denoised_temp_file(target_speakers[0]) as denoised_path:
-            result = model.forward_iteration(
+            result = model.forward_iteration_hdf5(
                 lang=lan.lower(),
-                text=get_whisper_text(target_speakers[0], asr_model),
-                target_sample=target_speakers[0],
-                ref_sample=ref_speakers,
+                text=df_target.text[df_target.speaker_id == target_speaker_id].iloc[0],
+                target_sample=target_store_ids,
+                ref_sample=ref_store_ids,
                 train_model=train_model,
                 max_conditioning_length=config.model_args.max_conditioning_length,
                 min_conditioning_length=config.model_args.min_conditioning_length,
                 tts=tts,
                 asr_model=asr_model,
                 ecapa=ecapa2,
+                target_hdf5_path=target_hdf5_path,  # ADD THIS
+                ref_hdf5_path=ref_hdf5_path,     # ADD THIS
+                n=5 
             )
             # get best audio based on quality scores
             best = np.where(np.max(result[2])==result[2])[0][0]
             # save first audio 
             anonymized_wav = result[3][best]
         
-        tqdm.tqdm.write(f"Anonymization done for {ref_file} + {target_speaker_folder}")
-        _,segment_quality_score_value = segment_quality_score(
-                asr_model,
-                get_speaker_embedding(target_speakers[0]).to(device),
-                get_speaker_embedding(ref_speakers).to(device),
-                anonymized_wav,
-                ecapa2
-            )
+        tqdm.tqdm.write(f"Anonymization done for {ref_speaker_id} + {target_speaker_id}")
         
         if isinstance(anonymized_wav, torch.Tensor):
             anonymized_wav = anonymized_wav.detach().cpu().numpy().squeeze()
         elif isinstance(anonymized_wav, list):
             anonymized_wav = np.array(anonymized_wav)
         
-
-        #anonymized_wav = result["wav"]
-        
         if model_name == 'xtts2_forward_iteration':
-            out_name = f"{os.path.splitext(ref_file)[0]}_to_{os.path.splitext(target_speaker_folder)[0]}"
+            out_name = f"{ref_speaker_id}_to_{target_speaker_id}_{target_store_ids}"
+            # Save first audio (iteration 0) to separate HDF5 file
+            iteration_0_hdf5_path = os.path.join(output_dir, "iteration_0_outputs.hdf5")
             # save first audio only
-            for index, wav in enumerate(result[3]):
-                sf.write(os.path.join(output_dir, f"{out_name}_{index}.wav"),  np.array(wav), model.config.audio.output_sample_rate)
-                break
+            for retry in range(0,5):
+                try:
+                    with h5py.File(iteration_0_hdf5_path, 'a') as hdf5_iter:
+                        key = f"{ref_speaker_id}_{target_speaker_id}_{target_store_ids}"
+                        if key in hdf5_iter:
+                            del hdf5_iter[key]
+                        hdf5_iter.create_dataset(key, data=result[3][0])
+                        hdf5_iter[key].attrs['sr'] = model.config.audio.output_sample_rate
+                        hdf5_iter[key].attrs['ref_speaker_id'] = ref_speaker_id
+                        hdf5_iter[key].attrs['target_speaker_id'] = target_speaker_id
+                    tqdm.tqdm.write(f"Saved iteration 0 output to HDF5: {iteration_0_hdf5_path}")
+                    break
+                    
+                except Exception as e:
+                    tqdm.tqdm.write(f"Error saving to HDF5: {e}")
+                    wait_time = 0.5 * (retry + 1)
+                    time.sleep(wait_time)  # wait before retrying
 
-        out_name = f"{os.path.splitext(ref_file)[0]}_to_{os.path.splitext(target_speaker_folder)[0]}.wav"
-        out_path = os.path.join(output_dir, out_name)
+        iteration_hdf5_path = os.path.join(output_dir, f"outputs.hdf5")
+        key = f"{ref_speaker_id}_to_{target_speaker_id}_{target_store_ids}.wav"
+        # save best audio
+        try:
+            with h5py.File(iteration_hdf5_path, 'a') as hdf5_iter:
+                if key in hdf5_iter:
+                    del hdf5_iter[key]
+                hdf5_iter.create_dataset(key, data=anonymized_wav)
+                hdf5_iter[key].attrs['sr'] = model.config.audio.output_sample_rate
+                hdf5_iter[key].attrs['ref_speaker_id'] = ref_speaker_id
+                hdf5_iter[key].attrs['target_speaker_id'] = target_speaker_id
+                tqdm.tqdm.write(f"Saved output to HDF5: {iteration_hdf5_path}")
+        except Exception as e:
+            tqdm.tqdm.write(f"Error saving to HDF5: {e}")
+
+           
+        
+        
+        best_out_name = f"{ref_speaker_id}_to_{target_speaker_id}_{target_store_ids}_best.wav"
+        out_path = os.path.join(output_dir, best_out_name)     
         sf.write(out_path, anonymized_wav, model.config.audio.output_sample_rate)
         tqdm.tqdm.write(f"Saved: {out_path}")
 
-        speaker_similarity_an_ref = calc_speaker_similarity(ref_speakers, out_path)
-        speaker_similarity_an_target = calc_speaker_similarity(target_speakers[0], out_path)
-        wer_score, bleu_score = calc_asr_wer_blue(target_speakers[0], out_path, asr_model)
-        tqdm.tqdm.write(f"Processed: {ref_file} + {target_speaker_folder} | Speaker Similarity: {speaker_similarity_an_ref:.4f} | WER: {wer_score} | BLEU: {bleu_score}")
+        speaker_similarity_an_ref = calc_speaker_similarity(ref_store_ids, 22050, out_path, ref_hdf5_path)
+        speaker_similarity_an_target = calc_speaker_similarity(target_store_ids, 22050, out_path, target_hdf5_path)
+
+        target_text = df_target.text[df_target.speaker_id == target_speaker_id].iloc[0]
+        wer_score, bleu_score = calc_asr_wer_blue(out_path, target_text, asr_model)
+        tqdm.tqdm.write(f"Processed: {ref_speaker_id} + {target_speaker_id} | Speaker Similarity: {speaker_similarity_an_ref:.4f} | WER: {wer_score} | BLEU: {bleu_score}")
+
 
         local_metadata.append({
-            "ref_file": ref_file,
-            "ref_path": ref_path,
-            "target_file": target_speaker_folder,
-            "target_path": target_path,
+            "ref_file": int(ref_speaker_id),  # Convert NumPy int64 to Python int
+            "target_file": int(target_speaker_id),  # Convert NumPy int64 to Python int
             "output_file": out_name,
             "output_path": out_path,
-            "WER": wer_score,
-            "BLEU": bleu_score,
-            "speaker_similarity_an_ref": speaker_similarity_an_ref,
-            "speaker_similarity_an_target": speaker_similarity_an_target,
-            "language": lan,
-            "segment_quality_score": segment_quality_score_value,
-            "min_ref_seg": min([i['ref_sim'] for i in segment_quality_score_value.values()]),
-            "min_tar_seg": max([i['target_sim'] for i in segment_quality_score_value.values()]),
-            "orig_target_path": target_speakers[0],
+            "WER": float(wer_score),  # Convert to Python float
+            "BLEU": float(bleu_score),  # Convert to Python float
+            "speaker_similarity_an_ref": float(speaker_similarity_an_ref),
+            "speaker_similarity_an_target": float(speaker_similarity_an_target),
+            "language": str(lan),  # Convert to Python str
+            "orig_target_path": f"{target_store_ids}",  
         })
         # ADD THIS: Mark this pair as completed and save checkpoint
-        pair_id = f"{ref_file}_{target_speaker_folder}"
+        pair_id = f"{int(ref_speaker_id)}_{int(target_speaker_id)}"
         # dont just fail the whole process if file already open
         while True:
             try:
@@ -342,7 +406,13 @@ def process_reference(ref_file, model, output_dir, train_model, config, model_na
                 time.sleep(30)  # Wait before retrying
     return local_metadata
 
-def main(model_name: str, output_dir: str = output_dir, name:str =f'{time.time()}'):
+def main(model_name: str, output_dir: str, name:str , ref_hdf5_path: str  , target_hdf5_path: str, ref_df = None, target_df = None,csv_output_dir: str = './csv_output/' ):
+    if ref_df is None and target_df is None:
+        ref_df = pd.read_csv('/data/train/metadata/metadata/result/100speaker_perlang.csv')
+        target_df = pd.read_csv('/data/train/metadata/metadata/result/100speaker_perlang.csv')
+    os.makedirs(csv_output_dir, exist_ok=True)
+
+    refernce_speaker_ids = ref_df.speaker_id.unique()
     checkpoint_filename = f"checkpoint_{model_name}_{name}.json"
     checkpoint_path = os.path.join(csv_output_dir, checkpoint_filename)
 
@@ -354,11 +424,10 @@ def main(model_name: str, output_dir: str = output_dir, name:str =f'{time.time()
     paths = ModelPaths()
     tts, model, train_model, config = load_tts_and_trainer(paths)
 
-    ref_files = os.listdir(references_dir)
-    with ThreadPoolExecutor(max_workers=4) as executor:  
+    with ThreadPoolExecutor(max_workers=2) as executor:  
         futures = [
-            executor.submit(process_reference, ref_file, model,  output_dir, train_model, config, model_name, tts, checkpoint_path)
-            for ref_file in ref_files
+            executor.submit(process_reference, ref_speaker_id, model,  output_dir, train_model, config, model_name, tts, checkpoint_path,ref_df, target_df,ref_hdf5_path, target_hdf5_path)
+            for ref_speaker_id in refernce_speaker_ids
         ]
         for future in tqdm.tqdm(as_completed(futures), total=len(futures), desc="References"):
             future.result()
@@ -369,9 +438,8 @@ def main(model_name: str, output_dir: str = output_dir, name:str =f'{time.time()
     df = pd.DataFrame(final_checkpoint["metadata"])
     df.to_csv(os.path.join(csv_output_dir, f"metadata_{model_name}_{name}.csv"), index=False)
     tqdm.tqdm.write(f"Metadata saved to metadata_{model_name}_{name}.csv")
-    """if os.path.exists(checkpoint_path):
-        os.remove(checkpoint_path)
-        print(f"Checkpoint file {checkpoint_filename} removed (run completed)")"""
+
 
 if __name__ == "__main__":
-    main("xtts2_forward_iteration", output_dir, name=f'top_references_by_reference')
+    output_dir = "/home/romolo/VT1/prog/streamlit_prog/outputs/"
+    main("xtts2_forward_iteration", output_dir, name=f'search_speaker_on_train_test',ref_hdf5_path='/data/train/audios/destination.hdf5', target_hdf5_path='/data/train/audios/destination.hdf5',csv_output_dir=os.path.join(output_dir,'csv_outputs'))

@@ -175,3 +175,5 @@ coqui_demos/*
 ./test_data/*
 config.json
 vocab.json
+metadata_xtts2_forward_run_large.csv
+*.zip

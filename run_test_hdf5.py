@@ -408,8 +408,8 @@ def process_reference(ref_speaker_id, model, output_dir, train_model, config, mo
 
 def main(model_name: str, output_dir: str, name:str , ref_hdf5_path: str  , target_hdf5_path: str, ref_df = None, target_df = None,csv_output_dir: str = './csv_output/' ):
     if ref_df is None and target_df is None:
-        ref_df = pd.read_csv('/data/train/metadata/metadata/result/100speaker_perlang.csv')
-        target_df = pd.read_csv('/data/train/metadata/metadata/result/100speaker_perlang.csv')
+        ref_df = pd.read_csv('/cluster/home/muletrom/result/100speaker_perlang.csv')
+        target_df = pd.read_csv('/cluster/home/muletrom/result/100speaker_perlang.csv')
     os.makedirs(csv_output_dir, exist_ok=True)
 
     refernce_speaker_ids = ref_df.speaker_id.unique()
@@ -424,7 +424,7 @@ def main(model_name: str, output_dir: str, name:str , ref_hdf5_path: str  , targ
     paths = ModelPaths()
     tts, model, train_model, config = load_tts_and_trainer(paths)
 
-    with ThreadPoolExecutor(max_workers=2) as executor:  
+    with ThreadPoolExecutor(max_workers=4) as executor:  
         futures = [
             executor.submit(process_reference, ref_speaker_id, model,  output_dir, train_model, config, model_name, tts, checkpoint_path,ref_df, target_df,ref_hdf5_path, target_hdf5_path)
             for ref_speaker_id in refernce_speaker_ids
@@ -441,5 +441,5 @@ def main(model_name: str, output_dir: str, name:str , ref_hdf5_path: str  , targ
 
 
 if __name__ == "__main__":
-    output_dir = "/home/romolo/VT1/prog/streamlit_prog/outputs/"
-    main("xtts2_forward_iteration", output_dir, name=f'search_speaker_on_train_test',ref_hdf5_path='/data/train/audios/destination.hdf5', target_hdf5_path='/data/train/audios/destination.hdf5',csv_output_dir=os.path.join(output_dir,'csv_outputs'))
+    output_dir = os.getenv('OUTPUT_PATH') if 'OUTPUT_PATH' in os.environ else '/cluster/home/muletrom/result/'
+    main("xtts2_forward_iteration", output_dir, name=f'search_speaker_on_train',ref_hdf5_path='/cluster/home/muletrom/data/destination.hdf5', target_hdf5_path='/cluster/home/muletrom/data/destination.hdf5',csv_output_dir=os.path.join(output_dir,'csv_outputs'))

@@ -1113,7 +1113,8 @@ class Xtts(BaseTTS):
         
         import tempfile
         import time
-        temp_hdf5_path = os.path.join(tempfile.gettempdir(), f"iter_temp_{os.getpid()}_{int(time.time())}.hdf5")
+        temp_hdf5_fd, temp_hdf5_path = tempfile.mkstemp(suffix='.hdf5', prefix='iter_temp_')
+        os.close(temp_hdf5_fd) 
 
         try:
             
@@ -1121,7 +1122,7 @@ class Xtts(BaseTTS):
                     wav = self.forward(o, ref_sample, train_model,ref_hdf5_path=ref_hdf5_path)
 
                     # Ensure file handle is properly closed by using context manager
-                    with h5py.File(temp_hdf5_path, 'w') as hdf5_temp:
+                    with h5py.File(temp_hdf5_path, 'a') as hdf5_temp:
                         iter_key = f'iteration_{i}'
                         if iter_key in hdf5_temp:
                             del hdf5_temp[iter_key]
@@ -1129,19 +1130,14 @@ class Xtts(BaseTTS):
                         hdf5_temp[iter_key].attrs['sr'] = 24000
                     # File is closed here
                         
-                    save_wavs[f"wav_{i}"] = f"{temp_hdf5_path}:{iter_key}"
+                    """save_wavs[f"wav_{i}"] = f"{temp_hdf5_path}:{iter_key}"
 
                     temp_asr_file = f"/tmp/asr_temp_{i}_{os.getpid()}.wav"
                     import soundfile as sf
-                    sf.write(temp_asr_file, wav['wav'], 24000)
-                    
-                    try:
-                        generated_text = asr_model.transcribe(temp_asr_file)["text"].lower()
-                    finally:
-                        try:
-                            os.unlink(temp_asr_file)
-                        except OSError:
-                            pass
+                    sf.write(temp_asr_file, wav['wav'], 24000)"""
+                    wav_for_asr = librosa.resample(wav['wav'], orig_sr=24000, target_sr=16000)
+                    wav_for_asr = wav_for_asr.astype('float32')
+                    generated_text = asr_model.transcribe(wav_for_asr,language=lang)["text"].lower()
                     
                     blue_score = sentence_bleu([text.lower().split()], generated_text.split(), smoothing_function=smoothie)
                     wer_score = wer(reference=text.lower(), hypothesis=generated_text)

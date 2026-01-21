@@ -18,8 +18,8 @@ from TTS.tts.models.base_tts import BaseTTS
 from TTS.utils.io import load_fsspec
 from jiwer import wer
 import re
-from evaluate import load
-bleu = load('sacrebleu')
+from sacrebleu import BLEU
+bleu_scorer = BLEU(effective_order=True)
 import h5py
 import numpy as np
 import unicodedata
@@ -393,6 +393,8 @@ class Xtts(BaseTTS):
         speaker_embeddings = []
         audios = []
         speaker_embedding = None
+        embedding_scores = []
+        
         for file_path in audio_paths:
             audio = load_audio(file_path, load_sr, hdf5_path=hdf5_path)
             audio = audio[:, : load_sr * max_ref_length].to(self.device)
@@ -407,6 +409,10 @@ class Xtts(BaseTTS):
 
             audios.append(audio)
 
+            # get energy
+            energy = torch.mean(audio ** 2).item()
+            embedding_scores.append(energy)
+
         # merge all the audios and compute the latents for the gpt
         full_audio = torch.cat(audios, dim=-1)
         gpt_cond_latents = self.get_gpt_cond_latents(
@@ -416,6 +422,12 @@ class Xtts(BaseTTS):
         """if speaker_embeddings:
             speaker_embedding = torch.stack(speaker_embeddings)
             speaker_embedding = speaker_embedding.mean(dim=0)"""
+        """weights = torch.tensor(embedding_scores) / sum(embedding_scores)
+        speaker_embeddings_stacked = torch.stack(speaker_embeddings)
+        weights_reshaped = weights.to(speaker_embeddings_stacked.device).view(-1, 1, 1, 1)
+
+        speaker_embedding = (speaker_embeddings_stacked * weights_reshaped).sum(dim=0)"""
+
         speaker_embedding = self.get_speaker_embedding(full_audio, load_sr)
 
         return gpt_cond_latents, speaker_embedding
@@ -1065,13 +1077,13 @@ class Xtts(BaseTTS):
                 conds.append(cond)
                 cond_lens.append(cond_len)
             # Example: average conditioning
-            cond = torch.stack(conds)#.mean(dim=0)
+            cond = torch.stack(conds).mean(dim=0)
             cond_len = int(sum(cond_lens) / len(cond_lens))
         else:
             cond, cond_len, _ = get_prompt_slice(
                 ref_sample, max_conditioning_length, min_conditioning_length, target_sample_rate, True, hdf5_path=ref_hdf5_path if ref_hdf5_path is not None else None
             )
-            cond = cond.unsqueeze(0)
+
         cond_idxs = torch.nan
 
         sample = {
@@ -1081,7 +1093,7 @@ class Xtts(BaseTTS):
             "wav": wav,
             "wav_lengths": torch.tensor(wav.shape[-1], dtype=torch.long),
             "filenames": target_sample,
-            "conditioning": cond,
+            "conditioning": cond.unsqueeze(1),
             "cond_lens": torch.tensor(cond_len, dtype=torch.long)
             if cond_len is not torch.nan
             else torch.tensor([cond_len]),
@@ -1199,7 +1211,7 @@ class Xtts(BaseTTS):
         
 
         save_wavs =  {}
-        save_scores = {"blue_scores": [], "wer_scores": [],"target_cosine_similarities": [],"reference_cosine_similarities": []}
+        save_scores = {"bleu_scores": [], "wer_scores": [],"target_cosine_similarities": [],"reference_cosine_similarities": []}
         audio_codes = []
         quality_scores = []
         audios = []
@@ -1217,30 +1229,54 @@ class Xtts(BaseTTS):
             # compute scores
             wav_for_asr = librosa.resample(wav['wav'], orig_sr=24000, target_sr=16000)
             #wav_for_asr_float = wav_for_asr.astype('float32')
+            
+            for i in range(3):
+                try:
+                    generated_text = asr_model.transcribe(anonymized_wav_res,language=lan)['text']
+                    if generated_text != None:
+                        break
+                except Exception as e:
+                    tqdm.tqdm.write(f"Error in ASR transcription: {e}")
+                    generated_text = ""
+                    time.sleep(1)  # wait before retrying
+            
+    
+            try:
+                wer_score = wer(text, generated_text)
+                break
+            except Exception as e:
+                tqdm.tqdm.write(f"Error computing WER: {e}")
+                wer_score = 1.0  # Assign worst score on error
+                time.sleep(1)  # wait before retrying
+            
 
-            generated_text = asr_model.transcribe(wav_for_asr,language=lang)["text"].lower()
-            blue_score = bleu.compute(predictions=[generated_text.lower()], references=[[text.lower()]])['score']
-            wer_score = wer(reference=text.lower(), hypothesis=generated_text.lower())
+            try:
+                bleu_score = bleu_scorer.sentence_score(generated_text,[text])["score"]/100.0
+                break
+            except Exception as e:
+                tqdm.tqdm.write(f"Error computing BLEU: {e}")
+                bleu_score = 0.0  # Assign worst score on error
+  # wait before retrying
 
 
 
-            save_scores["blue_scores"].append(blue_score)
+            save_scores["bleu_scores"].append(bleu_score)
             save_scores["wer_scores"].append(wer_score)
 
             # compute cosine similarities
             synth_audio = self.resample_audio_16k(f"/home/romolo/VT1/coqui-tts/data/outputs/models/iterate_output_{i}.wav")
 
             synth_emb = ecapa(synth_audio.to(device=self.device))
-            save_scores["target_cosine_similarities"].append(torch.cosine_similarity(tar_emb, synth_emb,dim=1))
-            save_scores["reference_cosine_similarities"].append(torch.cosine_similarity(ref_emb, synth_emb,dim=1))
-            print(f"Iteration {i}: BLUE: {blue_score}, WER: {wer_score}, Target Cosine: {save_scores['target_cosine_similarities'][-1]}, Reference Cosine: {save_scores['reference_cosine_similarities'][-1]}")
+            save_scores["target_cosine_similarities"].append(torch.cosine_similarity(tar_emb, synth_emb))
+            save_scores["reference_cosine_similarities"].append(torch.cosine_similarity(ref_emb, synth_emb))
+            print(f"Iteration {i}: BLEU: {bleu_score}, WER: {wer_score}, Target Cosine: {save_scores['target_cosine_similarities'][-1]}, Reference Cosine: {save_scores['reference_cosine_similarities'][-1]}")
             quality_score = (
                 0.05 * (1 - wer_score) +          # Lower WER is better
-                0.05 * blue_score +               # Higher BLEU is better
+                0.05 * bleu_score +               # Higher BLEU is better
                 0.30 * (1 - save_scores["target_cosine_similarities"][-1]) +         # Lower target similarity is better (voice conversion)
                 0.60 * save_scores["reference_cosine_similarities"][-1]                    # Higher ref similarity is better
             )
-            quality_scores.append(float(quality_score))
+            quality_scores.append(quality_score.item())
             audios.append(wav['wav'])
 
             # compute new audio codes for next iteration
@@ -1296,7 +1332,7 @@ class Xtts(BaseTTS):
         )
 
         save_wavs = {}
-        save_scores = {"blue_scores": [], "wer_scores": [], "target_cosine_similarities": [], "reference_cosine_similarities": []}
+        save_scores = {"bleu_scores": [], "wer_scores": [], "target_cosine_similarities": [], "reference_cosine_similarities": []}
         audio_codes = []
         quality_scores = []
         audios = []
@@ -1317,34 +1353,57 @@ class Xtts(BaseTTS):
                 wav = self.forward(o, ref_sample, train_model, ref_hdf5_path=ref_hdf5_path)
 
                 # Ensure file handle is properly closed by using context manager
-                with h5py.File(temp_hdf5_path, 'a') as hdf5_temp:
-                    iter_key = f'iteration_{i}'
-                    if iter_key in hdf5_temp:
-                        del hdf5_temp[iter_key]
-                    hdf5_temp.create_dataset(iter_key, data=wav['wav'])
-                    hdf5_temp[iter_key].attrs['sr'] = 24000
+                for i in range(3):
+                    try:
+                        with h5py.File(temp_hdf5_path, 'a') as hdf5_temp:
+                            iter_key = f'iteration_{i}'
+                            if iter_key in hdf5_temp:
+                                del hdf5_temp[iter_key]
+                            hdf5_temp.create_dataset(iter_key, data=wav['wav'])
+                            hdf5_temp[iter_key].attrs['sr'] = 24000
+                            break
+                    except Exception as e:
+                        print(f"Error writing to temp HDF5 file {temp_hdf5_path}: {e}")
+                        time.sleep(1)
+                        raise e
                 # File is closed here
                     
                 wav_for_asr = librosa.resample(wav['wav'], orig_sr=24000, target_sr=16000)
                 #wav_for_asr_float = wav_for_asr.astype('float32')
                 generated_text = asr_model.transcribe(wav_for_asr, language=lang)["text"].lower()
-                generated_text = clean_text(generated_text)
-                text = clean_text(text)
-                blue_score = bleu.compute(predictions=[generated_text.lower()], references=[[text.lower()]])['score']
-                wer_score = wer(reference=text.lower(), hypothesis=generated_text)
-
-                save_scores["blue_scores"].append(blue_score)
+                generated_text = clean_text(generated_text).lower()
+                text = clean_text(text).lower()
+                try:
+                    bleu_score = bleu_scorer.sentence_score(generated_text,[text]).score/100.0
+                except:
+                    bleu_score = 0.0
+                try:
+                    wer_score = wer(reference=text, hypothesis=generated_text)
+                except:
+                    wer_score = 1.0
+                
+                save_scores["bleu_scores"].append(bleu_score)
                 save_scores["wer_scores"].append(wer_score)
 
                 # compute cosine similarities
                 synth_emb = ecapa(torch.tensor(wav_for_asr).unsqueeze(0).to(device=self.device))
-                save_scores["target_cosine_similarities"].append(torch.cosine_similarity(tar_emb, synth_emb,dim=1))
-                save_scores["reference_cosine_similarities"].append(torch.cosine_similarity(ref_emb, synth_emb,dim=1))
-                print(f"Iteration {i}: BLUE: {blue_score}, WER: {wer_score}, Target Cosine: {save_scores['target_cosine_similarities'][-1]}, Reference Cosine: {save_scores['reference_cosine_similarities'][-1]}")
-                quality_score = (
-                    0.5 * max(0, 1 - wer_score) +
-                    0.5 * (1 - max(0, save_scores["target_cosine_similarities"][-1]))
-                )
+                save_scores["target_cosine_similarities"].append(torch.cosine_similarity(tar_emb, synth_emb))
+                save_scores["reference_cosine_similarities"].append(torch.cosine_similarity(ref_emb, synth_emb))
+
+                print(f"Iteration {i}: BLEU: {bleu_score}, WER: {wer_score}, Target Cosine: {save_scores['target_cosine_similarities'][-1]}, Reference Cosine: {save_scores['reference_cosine_similarities'][-1]}")
+                try:
+                    if (1 - wer_score) +(1 - save_scores["target_cosine_similarities"][-1]) == 0:
+                        quality_score = 0.0
+                    else:
+                        quality_score = (
+                            2*(
+                                (1 - wer_score) *(1 - save_scores["target_cosine_similarities"][-1])
+                            )/(
+                                (1 - wer_score) +(1 - save_scores["target_cosine_similarities"][-1])
+                            )
+                        )
+                except:
+                    quality_score = 0.0
                 quality_scores.append(float(quality_score))
                 audios.append(wav['wav'])
 
@@ -1391,10 +1450,14 @@ class Xtts(BaseTTS):
             target_hdf5_path,
             ref_hdf5_path,
             n = 5,
+            predicted_texts = None
             ):
         
+        if predicted_texts == None:
+            predicted_texts = texts
+
         ecapa_device = next(ecapa.parameters()).device
-        batch_size = len(texts) 
+        batch_size = len(predicted_texts) 
         # for score calculation pre calculate target and ref embeddings
         target_audios = []
 
@@ -1421,7 +1484,7 @@ class Xtts(BaseTTS):
 
         o = self.prep_batch_multiple(
             langs,
-            texts,
+            predicted_texts,
             target_samples,
             ref_samples,
             train_model.to(self.device),
@@ -1434,12 +1497,12 @@ class Xtts(BaseTTS):
 
         save_wavs = {}
         save_scores = {
-            "blue_scores": [[] for _ in range(batch_size)],
+            "bleu_scores": [[] for _ in range(batch_size)],
             "wer_scores": [[] for _ in range(batch_size)],
             "target_cosine_similarities": [[] for _ in range(batch_size)],
             "reference_cosine_similarities": [[] for _ in range(batch_size)]
         }
-        quality_scores = [[] for _ in range(batch_size)]
+
         audio_codes = [[] for _ in range(batch_size)]
         quality_scores = [[] for _ in range(batch_size)]
         audios = [[] for _ in range(batch_size)] 
@@ -1487,7 +1550,7 @@ class Xtts(BaseTTS):
                     generated_text = asr_model.transcribe(wav_for_asr_float, language=lang)["text"].lower()
                     generated_text = clean_text(generated_text)
                     text = clean_text(text)
-                    blue_score = bleu.compute(predictions=[generated_text.lower()], references=[[text.lower()]])['score']
+                    bleu_score = bleu_scorer.sentence_score(generated_text,[text])["score"]/100.0
                     
                     wer_score = wer(reference=text.lower(), hypothesis=generated_text.lower())
 
@@ -1504,24 +1567,23 @@ class Xtts(BaseTTS):
                     ref_cos = torch.cosine_similarity(ref_emb_single.unsqueeze(0), synth_emb.unsqueeze(0)).squeeze().item()
                     
                     # save scores
-                    save_scores["blue_scores"][batch_idx].append(blue_score)
+                    save_scores["bleu_scores"][batch_idx].append(bleu_score)
                     save_scores["wer_scores"][batch_idx].append(wer_score)
                     save_scores["target_cosine_similarities"][batch_idx].append(tar_cos)
                     save_scores["reference_cosine_similarities"][batch_idx].append(ref_cos)
                     
-                    quality_score = (
-                        0.25 * max(0, 1 - wer_score) +
-                        0.75 * (1 - tar_cos)
-                    )
-                    quality_scores[batch_idx].append(quality_score if isinstance(quality_score, float) else quality_score.item())
-                    print(f"Sample {batch_idx}, Iteration {i}: BLUE: {blue_score}, WER: {wer_score}, Quality: {quality_scores[batch_idx][-1]}")
+                    quality_score = 2 *(1-wer_score) * (1 - tar_cos) /  ((1 - wer_score) + (1 - tar_cos)) if ((1 - wer_score) + (1 - tar_cos)) != 0 else 0.0
+                    # Alternative simpler quality score
+
+                    quality_scores[batch_idx].append(float(quality_score))
+                    print(f"Sample {batch_idx}, Iteration {i}: BLEU: {bleu_score}, WER: {wer_score}, Quality: {quality_scores[batch_idx][-1]}")
 
                 # compute new audio codes for next iteration
                 if i < n - 1:
                     next_target_samples = [f'sample_{batch_idx}_iteration_{i}' for batch_idx in range(batch_size)]
                     o = self.prep_batch_multiple(
                         langs,
-                        texts,
+                        predicted_texts,
                         next_target_samples,
                         ref_samples,
                         train_model.to(self.device),

@@ -17,9 +17,12 @@ from TTS.tts.layers.xtts.xtts_manager import SpeakerManager, LanguageManager
 from TTS.tts.models.base_tts import BaseTTS
 from TTS.utils.io import load_fsspec
 from jiwer import wer
-from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
+import re
+from evaluate import load
+bleu = load('sacrebleu')
 import h5py
-
+import numpy as np
+import unicodedata
 
 init_stream_support()
 
@@ -71,19 +74,34 @@ def wav_to_mel_cloning(
     mel = mel / mel_norms.unsqueeze(0).unsqueeze(-1)
     return mel
 
+def clean_text(text):
+    # Convert to lowercase
+    text = text.lower()
+    # Replace German ß with ss
+    text = text.replace('ß', 'ss')
+    # Replace common Unicode variations (accents, umlauts, etc.)
 
-def load_audio(audiopath, sampling_rate,hdf5_path=None,original_sr=None):
-    # better load setting following: https://github.com/faroit/python_audio_loading_benchmark
+    text = unicodedata.normalize('NFKD', text)
+    text = ''.join([c for c in text if not unicodedata.combining(c)])
+    # Remove punctuation and keep only word characters and whitespace
+    cleaned = re.sub(r'[^\w\s]', '', text)
+    # Remove extra whitespace
+    cleaned = ' '.join(cleaned.split())
+    return cleaned
 
-    # torchaudio should chose proper backend to load audio depending on platform
+def load_audio(audiopath, orig_sr, hdf5_path=None):
+    """Load audio and resample to target sample rate
+    
+    Args:
+        audiopath: Path or HDF5 key
+        target_sr: Target sample rate to resample to
+        hdf5_path: If provided, load from HDF5
+    """
+    target_sr = 22050
     if hdf5_path is not None:
-        audio = load_audio_hdf5(hdf5_path, audiopath)
-        if original_sr is not None:
-            lsr = original_sr
-        else:
-            lsr = sampling_rate
+        audio = load_audio_hdf5(hdf5_path, str(audiopath))
     else:
-        audio, lsr = torchaudio.load(audiopath)
+        audio, orig_sr = torchaudio.load(audiopath)
 
     # stereo to mono if needed
     if audio.dim() == 1:
@@ -91,16 +109,17 @@ def load_audio(audiopath, sampling_rate,hdf5_path=None,original_sr=None):
     elif audio.size(0) != 1:
         audio = torch.mean(audio, dim=0, keepdim=True)
 
-    if lsr != sampling_rate:
-        audio = torchaudio.functional.resample(audio, lsr, sampling_rate)
 
-    # Check some assumptions about audio range. This should be automatically fixed in load_wav_to_torch, but might not be in some edge cases, where we should squawk.
-    # '10' is arbitrarily chosen since it seems like audio will often "overdrive" the [-1,1] bounds.
+    if orig_sr != target_sr:
+        audio = torchaudio.functional.resample(audio, orig_sr, target_sr)
+
+    # Validation
     if torch.any(audio > 10) or not torch.any(audio < 0):
         print(f"Error with {audiopath}. Max={audio.max()} min={audio.min()}")
-    # clip audio invalid values
-    audio.clip_(-1, 1)
+    audio = audio.clip(-1, 1)
+    
     return audio
+
 
 def load_audio_hdf5(hdf5_path, file_key):
         with h5py.File(hdf5_path, "r") as hdf5_file:
@@ -383,8 +402,8 @@ class Xtts(BaseTTS):
                 audio = librosa.effects.trim(audio, top_db=librosa_trim_db)[0]
 
             # compute latents for the decoder
-            speaker_embedding = self.get_speaker_embedding(audio, load_sr)
-            speaker_embeddings.append(speaker_embedding)
+            """speaker_embedding = self.get_speaker_embedding(audio, load_sr)
+            speaker_embeddings.append(speaker_embedding)"""
 
             audios.append(audio)
 
@@ -394,9 +413,10 @@ class Xtts(BaseTTS):
             full_audio, load_sr, length=gpt_cond_len, chunk_length=gpt_cond_chunk_len
         )  # [1, 1024, T]
 
-        if speaker_embeddings:
+        """if speaker_embeddings:
             speaker_embedding = torch.stack(speaker_embeddings)
-            speaker_embedding = speaker_embedding.mean(dim=0)
+            speaker_embedding = speaker_embedding.mean(dim=0)"""
+        speaker_embedding = self.get_speaker_embedding(full_audio, load_sr)
 
         return gpt_cond_latents, speaker_embedding
 
@@ -880,8 +900,98 @@ class Xtts(BaseTTS):
         return {
             "wav": wav_audio_codes.cpu().squeeze().numpy(),
         }
+    
+    @torch.no_grad()
+    def forward_from_batch(self, o, ref_samples, train_model, ref_hdf5_path=None):
+        device = self.device
 
+        text_inputs = o["text_inputs"].to(device)
+        text_lengths = o["text_lengths"].to(device)
+        audio_codes = o["audio_codes"].to(device)
+        wav_lengths = o["wav_lengths"].to(device)
+        cond_lens = o["cond_lens"].to(device)
+        train_model = train_model.to(device)
 
+        train_model.training = False
+        with torch.no_grad():
+            batch_size = text_inputs.shape[0]
+            
+            # Process conditioning latents for each batch item
+            gpt_cond_latents_list = []
+            speaker_embeddings_list = []
+            gpt_latents_list = []
+            
+            # Handle both single ref_sample and list of ref_samples
+            if isinstance(ref_samples, list):
+                ref_list = ref_samples
+            else:
+                ref_list = [ref_samples] * batch_size
+            
+            # Process each sample INDEPENDENTLY through GPT to match single-mode behavior
+            for idx in range(batch_size):
+                ref_sample = ref_list[idx]
+                
+                # Get conditioning for this sample
+                (gpt_cond_latent, speaker_embedding) = self.get_conditioning_latents(
+                    audio_path=ref_sample,
+                    gpt_cond_len=45,
+                    gpt_cond_chunk_len=15,
+                    max_ref_length=45,
+                    sound_norm_refs=False,
+                    hdf5_path=ref_hdf5_path if ref_hdf5_path is not None else None
+                )
+                gpt_cond_latents_list.append(gpt_cond_latent)
+                speaker_embeddings_list.append(speaker_embedding)
+                
+                # Process this sample ALONE through GPT (not batched)
+                # Extract single sample from batch
+                text_input_single = text_inputs[idx:idx+1]  # Keep batch dim
+                text_length_single = text_lengths[idx:idx+1]
+                audio_code_single = audio_codes[idx:idx+1]
+                wav_length_single = wav_lengths[idx:idx+1]
+                
+                # Forward through GPT with single sample
+                gpt_latent_single = self.gpt(
+                    text_input_single,
+                    text_length_single,
+                    audio_code_single,
+                    wav_length_single,
+                    cond_latents=gpt_cond_latent,
+                    return_attentions=False,
+                    return_latent=True,
+                )
+                gpt_latents_list.append(gpt_latent_single)
+            
+            max_latent_len = max(latent.shape[1] for latent in gpt_latents_list)
+            gpt_latents_padded = []
+            for latent in gpt_latents_list:
+                if latent.shape[1] < max_latent_len:
+                    # Pad sequence dimension (dim 1)
+                    pad_amount = max_latent_len - latent.shape[1]
+                    latent_padded = F.pad(latent, (0, 0, 0, pad_amount))  # Pad end of dim 1
+                    gpt_latents_padded.append(latent_padded)
+                else:
+                    gpt_latents_padded.append(latent)
+            
+            # Stack latents back into batch
+            gpt_latents = torch.cat(gpt_latents_padded, dim=0)   # [B, T, 1024]
+            
+            # Stack speaker embeddings
+            speaker_embeddings_squeezed = [se.squeeze(0) for se in speaker_embeddings_list]
+            speaker_embedding = torch.stack(speaker_embeddings_squeezed)
+
+        wav_audio_codes = self.hifigan_decoder(gpt_latents.clone(), g=speaker_embedding.clone()).cpu()
+        wav_audio_codes = wav_audio_codes.squeeze(1)  # [B, output_length]
+
+        # wav_lengths contains the ORIGINAL audio code lengths (before padding to batch max)
+        # Convert to output audio lengths using code_stride_len
+        code_stride_len = self.args.gpt_code_stride_len
+        actual_output_lengths = (wav_lengths.cpu() * code_stride_len).tolist()
+
+        return {
+            "wav": wav_audio_codes.numpy(),
+            "wav_lengths": actual_output_lengths,
+        }
     def collate_fn(self, batch):
         # convert list of dicts to dict of lists
         B = len(batch)
@@ -950,18 +1060,18 @@ class Xtts(BaseTTS):
             conds, cond_lens = [], []
             for ref in ref_sample:
                 cond, cond_len, _ = get_prompt_slice(
-                    ref, max_conditioning_length, min_conditioning_length, 22050, True, hdf5_path=ref_hdf5_path if ref_hdf5_path is not None else None
+                    ref, max_conditioning_length, min_conditioning_length, target_sample_rate, True, hdf5_path=ref_hdf5_path if ref_hdf5_path is not None else None
                 )
                 conds.append(cond)
                 cond_lens.append(cond_len)
             # Example: average conditioning
-            cond = torch.stack(conds).mean(dim=0)
+            cond = torch.stack(conds)#.mean(dim=0)
             cond_len = int(sum(cond_lens) / len(cond_lens))
         else:
             cond, cond_len, _ = get_prompt_slice(
-                ref_sample, max_conditioning_length, min_conditioning_length, 22050, True, hdf5_path=ref_hdf5_path if ref_hdf5_path is not None else None
+                ref_sample, max_conditioning_length, min_conditioning_length, target_sample_rate, True, hdf5_path=ref_hdf5_path if ref_hdf5_path is not None else None
             )
-
+            cond = cond.unsqueeze(0)
         cond_idxs = torch.nan
 
         sample = {
@@ -971,7 +1081,7 @@ class Xtts(BaseTTS):
             "wav": wav,
             "wav_lengths": torch.tensor(wav.shape[-1], dtype=torch.long),
             "filenames": target_sample,
-            "conditioning": cond.unsqueeze(1),
+            "conditioning": cond,
             "cond_lens": torch.tensor(cond_len, dtype=torch.long)
             if cond_len is not torch.nan
             else torch.tensor([cond_len]),
@@ -984,6 +1094,78 @@ class Xtts(BaseTTS):
                 collated[k] = v.to(device)
         o = train_model.format_batch_on_device(collated)
         return o
+
+    def prep_batch_multiple(self, langs, 
+                    texts,
+                    target_samples,
+                    ref_samples,
+                    train_model,
+                    max_conditioning_length,
+                    min_conditioning_length,
+                    target_hdf5_path=None,
+                    ref_hdf5_path=None,
+                    target_sample_rate=22050):
+        from TTS.tts.layers.xtts.trainer.dataset import get_prompt_slice
+        
+        batch_samples = []
+        device = self.device 
+        max_conditioning_length = int(max_conditioning_length)
+        min_conditioning_length = int(min_conditioning_length)
+
+        # Process each sample and collect into batch_samples list
+        for text, target_sample, ref_sample, lang in zip(texts, target_samples, ref_samples, langs):
+            
+            # Load audio
+            wav = load_audio(target_sample, target_sample_rate, hdf5_path=target_hdf5_path)
+            if wav.dim() == 1:
+                wav = wav.unsqueeze(0)
+
+            # Tokenize text
+            tokens = self.tokenizer.encode(text, lang)
+            tseq = torch.IntTensor(tokens)
+
+            # Get conditioning
+            if isinstance(ref_sample, list):
+                conds, cond_lens = [], []
+                for ref in ref_sample:
+                    cond, cond_len, _ = get_prompt_slice(
+                        ref, max_conditioning_length, min_conditioning_length, 22050, True, 
+                        hdf5_path=ref_hdf5_path
+                    )
+                    conds.append(cond)
+                    cond_lens.append(cond_len)
+                cond = torch.stack(conds).mean(dim=0)
+                cond_len = int(sum(cond_lens) / len(cond_lens))
+            else:
+                cond, cond_len, _ = get_prompt_slice(
+                    ref_sample, max_conditioning_length, min_conditioning_length, 22050, True, 
+                    hdf5_path=ref_hdf5_path
+                )
+
+            # Create sample dict
+            sample = {
+                "text": tseq,
+                "text_lengths": torch.tensor(tseq.shape[0], dtype=torch.long),
+                "wav": wav,
+                "wav_lengths": torch.tensor(wav.shape[-1], dtype=torch.long),
+                "filenames": target_sample,
+                "conditioning": cond.unsqueeze(1),
+                "cond_lens": torch.tensor(cond_len, dtype=torch.long) if cond_len is not torch.nan else torch.tensor([cond_len]),
+                "cond_idxs": torch.tensor(torch.nan),
+            }
+            batch_samples.append(sample)
+        
+        # Let collate_fn handle all the batching
+        collated = self.collate_fn(batch_samples)
+        
+        for k, v in collated.items():
+            if isinstance(v, torch.Tensor):
+                collated[k] = v.to(device)
+        
+        # Format for the model
+        o = train_model.format_batch_on_device(collated)
+        return o
+
 
     @torch.no_grad()
     def forward_iteration(self, lang,
@@ -1000,17 +1182,17 @@ class Xtts(BaseTTS):
 
         # for score calculation pre calculate target and ref embeddings
         target_audio = self.resample_audio_16k(target_sample)
-        ref_audio = self.resample_audio_16k(ref_sample[0])
-        ref_emb = ecapa(ref_audio.to(device=self.device))
-        tar_emb = ecapa(target_audio.to(device=self.device))
-        smoothie = SmoothingFunction().method4
+        ref_audio = self.resample_audio_16k(ref_sample if isinstance(ref_sample, str) else ref_sample[0])
+        ecapa_device = next(ecapa.parameters()).device
+        ref_emb = ecapa(ref_audio.to(device=ecapa_device))
+        tar_emb = ecapa(target_audio.to(device=ecapa_device))
 
         o = self.prep_batch(
             lang,
             text,
             target_sample,
             ref_sample,
-            train_model,
+            train_model.to(self.device),
             max_conditioning_length,
             min_conditioning_length
         )
@@ -1023,6 +1205,7 @@ class Xtts(BaseTTS):
         audios = []
 
         for i in range(0, n):
+            
             wav = self.forward(o, ref_sample, train_model)
 
             # save wav path for each iteration
@@ -1032,9 +1215,15 @@ class Xtts(BaseTTS):
             save_wavs[f"wav_{i}"] = f"/home/romolo/VT1/coqui-tts/data/outputs/models/iterate_output_{i}.wav"
 
             # compute scores
-            generated_text = asr_model.transcribe(f"/home/romolo/VT1/coqui-tts/data/outputs/models/iterate_output_{i}.wav")["text"].lower()
-            blue_score = sentence_bleu([text.lower().split()],generated_text.split(), smoothing_function=smoothie)
-            wer_score = wer(reference=text.lower(), hypothesis=generated_text)
+            wav_for_asr = librosa.resample(wav['wav'], orig_sr=24000, target_sr=16000)
+            #wav_for_asr_float = wav_for_asr.astype('float32')
+
+            generated_text = asr_model.transcribe(wav_for_asr,language=lang)["text"].lower()
+            blue_score = bleu.compute(predictions=[generated_text.lower()], references=[[text.lower()]])['score']
+            wer_score = wer(reference=text.lower(), hypothesis=generated_text.lower())
+
+
+
             save_scores["blue_scores"].append(blue_score)
             save_scores["wer_scores"].append(wer_score)
 
@@ -1042,8 +1231,8 @@ class Xtts(BaseTTS):
             synth_audio = self.resample_audio_16k(f"/home/romolo/VT1/coqui-tts/data/outputs/models/iterate_output_{i}.wav")
 
             synth_emb = ecapa(synth_audio.to(device=self.device))
-            save_scores["target_cosine_similarities"].append(torch.cosine_similarity(tar_emb, synth_emb))
-            save_scores["reference_cosine_similarities"].append(torch.cosine_similarity(ref_emb, synth_emb))
+            save_scores["target_cosine_similarities"].append(torch.cosine_similarity(tar_emb, synth_emb,dim=1))
+            save_scores["reference_cosine_similarities"].append(torch.cosine_similarity(ref_emb, synth_emb,dim=1))
             print(f"Iteration {i}: BLUE: {blue_score}, WER: {wer_score}, Target Cosine: {save_scores['target_cosine_similarities'][-1]}, Reference Cosine: {save_scores['reference_cosine_similarities'][-1]}")
             quality_score = (
                 0.05 * (1 - wer_score) +          # Lower WER is better
@@ -1051,7 +1240,7 @@ class Xtts(BaseTTS):
                 0.30 * (1 - save_scores["target_cosine_similarities"][-1]) +         # Lower target similarity is better (voice conversion)
                 0.60 * save_scores["reference_cosine_similarities"][-1]                    # Higher ref similarity is better
             )
-            quality_scores.append(quality_score.item())
+            quality_scores.append(float(quality_score))
             audios.append(wav['wav'])
 
             # compute new audio codes for next iteration
@@ -1061,7 +1250,7 @@ class Xtts(BaseTTS):
                 text,
                 f"/home/romolo/VT1/coqui-tts/data/outputs/models/iterate_output_{i}.wav",
                 ref_sample,
-                train_model,
+                train_model.to(self.device),
                 max_conditioning_length,
                 min_conditioning_length
                 )
@@ -1069,7 +1258,8 @@ class Xtts(BaseTTS):
                 audio_codes.append(o["audio_codes"])
 
         return save_wavs, save_scores, quality_scores, audios
-    
+   
+
     @torch.no_grad()
     def forward_iteration_hdf5(self, lang,
             text,
@@ -1089,16 +1279,16 @@ class Xtts(BaseTTS):
         # for score calculation pre calculate target and ref embeddings
         target_audio = self.resample_audio_16k(target_sample, hdf5_path=target_hdf5_path)
         ref_audio = self.resample_audio_16k(ref_sample if isinstance(ref_sample, str) else ref_sample[0], hdf5_path=ref_hdf5_path)
-        ref_emb = ecapa(ref_audio.to(device=self.device))
-        tar_emb = ecapa(target_audio.to(device=self.device))
-        smoothie = SmoothingFunction().method4
+        ecapa_device = next(ecapa.parameters()).device
+        ref_emb = ecapa(ref_audio.to(device=ecapa_device))
+        tar_emb = ecapa(target_audio.to(device=ecapa_device))
 
         o = self.prep_batch(
             lang,
             text,
             target_sample,
             ref_sample,
-            train_model,
+            train_model.to(self.device),
             max_conditioning_length,
             min_conditioning_length,
             target_hdf5_path=target_hdf5_path,
@@ -1113,72 +1303,236 @@ class Xtts(BaseTTS):
         
         import tempfile
         import time
-        temp_hdf5_fd, temp_hdf5_path = tempfile.mkstemp(suffix='.hdf5', prefix='iter_temp_')
+        
+        PROJECT_TEMP_DIR = os.getenv("PROJECT_TEMP_DIR", "./temp/")
+        os.makedirs(PROJECT_TEMP_DIR, exist_ok=True)
+        temp_hdf5_fd, temp_hdf5_path = tempfile.mkstemp(suffix='.hdf5', prefix='iter_temp_', dir=PROJECT_TEMP_DIR)
         os.close(temp_hdf5_fd) 
 
         try:
             
-                for i in range(0, n):
-                    wav = self.forward(o, ref_sample, train_model,ref_hdf5_path=ref_hdf5_path)
+            for i in range(0, n):
 
-                    # Ensure file handle is properly closed by using context manager
+                
+                wav = self.forward(o, ref_sample, train_model, ref_hdf5_path=ref_hdf5_path)
+
+                # Ensure file handle is properly closed by using context manager
+                with h5py.File(temp_hdf5_path, 'a') as hdf5_temp:
+                    iter_key = f'iteration_{i}'
+                    if iter_key in hdf5_temp:
+                        del hdf5_temp[iter_key]
+                    hdf5_temp.create_dataset(iter_key, data=wav['wav'])
+                    hdf5_temp[iter_key].attrs['sr'] = 24000
+                # File is closed here
+                    
+                wav_for_asr = librosa.resample(wav['wav'], orig_sr=24000, target_sr=16000)
+                #wav_for_asr_float = wav_for_asr.astype('float32')
+                generated_text = asr_model.transcribe(wav_for_asr, language=lang)["text"].lower()
+                generated_text = clean_text(generated_text)
+                text = clean_text(text)
+                blue_score = bleu.compute(predictions=[generated_text.lower()], references=[[text.lower()]])['score']
+                wer_score = wer(reference=text.lower(), hypothesis=generated_text)
+
+                save_scores["blue_scores"].append(blue_score)
+                save_scores["wer_scores"].append(wer_score)
+
+                # compute cosine similarities
+                synth_emb = ecapa(torch.tensor(wav_for_asr).unsqueeze(0).to(device=self.device))
+                save_scores["target_cosine_similarities"].append(torch.cosine_similarity(tar_emb, synth_emb,dim=1))
+                save_scores["reference_cosine_similarities"].append(torch.cosine_similarity(ref_emb, synth_emb,dim=1))
+                print(f"Iteration {i}: BLUE: {blue_score}, WER: {wer_score}, Target Cosine: {save_scores['target_cosine_similarities'][-1]}, Reference Cosine: {save_scores['reference_cosine_similarities'][-1]}")
+                quality_score = (
+                    0.5 * max(0, 1 - wer_score) +
+                    0.5 * (1 - max(0, save_scores["target_cosine_similarities"][-1]))
+                )
+                quality_scores.append(float(quality_score))
+                audios.append(wav['wav'])
+
+                # compute new audio codes for next iteration
+                if i < n - 1:
+                    o = self.prep_batch(
+                        lang,
+                        text,
+                        f'iteration_{i}',
+                        ref_sample,
+                        train_model.to(self.device),
+                        max_conditioning_length,
+                        min_conditioning_length,
+                        target_hdf5_path=temp_hdf5_path,
+                        ref_hdf5_path=ref_hdf5_path,
+                        target_sample_rate=24000
+                    )
+
+                        
+                    
+        finally:
+            # Robust cleanup
+            try:
+                if os.path.exists(temp_hdf5_path):
+                    os.unlink(temp_hdf5_path)
+                    print(f"Cleaned up temp HDF5 file: {temp_hdf5_path}")
+            except OSError as e:
+                print(f"Warning: Could not delete temp HDF5 file {temp_hdf5_path}: {e}")
+                
+        return save_wavs, save_scores, quality_scores, audios
+
+
+    @torch.no_grad()
+    def forward_iteration_hdf5_with_batch(self, langs,
+            texts,
+            target_samples,
+            ref_samples,
+            train_model,
+            max_conditioning_length,
+            min_conditioning_length,
+            tts,
+            ecapa,
+            asr_model,
+            target_hdf5_path,
+            ref_hdf5_path,
+            n = 5,
+            ):
+        
+        ecapa_device = next(ecapa.parameters()).device
+        batch_size = len(texts) 
+        # for score calculation pre calculate target and ref embeddings
+        target_audios = []
+
+        for target_sample in target_samples:
+            target_audio = self.resample_audio_16k(target_sample, hdf5_path=target_hdf5_path)
+            target_audios.append(target_audio)
+
+        ref_audios = []
+        for ref_sample in ref_samples:
+            ref_audio = self.resample_audio_16k(ref_sample if isinstance(ref_sample, str) else ref_sample[0], hdf5_path=ref_hdf5_path)
+            ref_audios.append(ref_audio)
+        
+        tar_embs = []
+        for target_audio in target_audios:
+            tar_emb = ecapa(target_audio.to(device=ecapa_device))
+            tar_embs.append(tar_emb)
+        tar_embs = torch.stack(tar_embs)  # Shape: [B, embedding_dim]
+        
+        ref_embs = []
+        for ref_audio in ref_audios:
+            ref_emb = ecapa(ref_audio.to(device=ecapa_device))
+            ref_embs.append(ref_emb)
+        ref_embs = torch.stack(ref_embs)
+
+        o = self.prep_batch_multiple(
+            langs,
+            texts,
+            target_samples,
+            ref_samples,
+            train_model.to(self.device),
+            max_conditioning_length,
+            min_conditioning_length,
+            target_hdf5_path=target_hdf5_path,
+            ref_hdf5_path=ref_hdf5_path
+        )
+
+
+        save_wavs = {}
+        save_scores = {
+            "blue_scores": [[] for _ in range(batch_size)],
+            "wer_scores": [[] for _ in range(batch_size)],
+            "target_cosine_similarities": [[] for _ in range(batch_size)],
+            "reference_cosine_similarities": [[] for _ in range(batch_size)]
+        }
+        quality_scores = [[] for _ in range(batch_size)]
+        audio_codes = [[] for _ in range(batch_size)]
+        quality_scores = [[] for _ in range(batch_size)]
+        audios = [[] for _ in range(batch_size)] 
+        
+        import tempfile
+        import time
+        
+        PROJECT_TEMP_DIR = os.getenv("PROJECT_TEMP_DIR", "./temp/")
+        os.makedirs(PROJECT_TEMP_DIR, exist_ok=True)
+        temp_hdf5_fd, temp_hdf5_path = tempfile.mkstemp(suffix='.hdf5', prefix='iter_temp_', dir=PROJECT_TEMP_DIR)
+        os.close(temp_hdf5_fd) 
+
+        try:
+            
+            for i in range(0, n):
+                wav = self.forward_from_batch(o, ref_samples, train_model, ref_hdf5_path=ref_hdf5_path)
+                
+
+                batch_size = len(texts)
+                wav_lengths = wav.get("wav_lengths", [wav['wav'].shape[1]] * batch_size)
+                for batch_idx in range(batch_size):
+
+                    
+                    lang = langs[batch_idx]
+                    text = texts[batch_idx]
+                    
+                    actual_length = int(wav_lengths[batch_idx])
+                    audio_sample = wav['wav'][batch_idx, :actual_length]
+
+                    
+
                     with h5py.File(temp_hdf5_path, 'a') as hdf5_temp:
-                        iter_key = f'iteration_{i}'
+                        iter_key = f'sample_{batch_idx}_iteration_{i}'
                         if iter_key in hdf5_temp:
                             del hdf5_temp[iter_key]
-                        hdf5_temp.create_dataset(iter_key, data=wav['wav'])
+                        hdf5_temp.create_dataset(iter_key, data=audio_sample)
                         hdf5_temp[iter_key].attrs['sr'] = 24000
-                    # File is closed here
-                        
-                    """save_wavs[f"wav_{i}"] = f"{temp_hdf5_path}:{iter_key}"
-
-                    temp_asr_file = f"/tmp/asr_temp_{i}_{os.getpid()}.wav"
-                    import soundfile as sf
-                    sf.write(temp_asr_file, wav['wav'], 24000)"""
-                    wav_for_asr = librosa.resample(wav['wav'], orig_sr=24000, target_sr=16000)
-                    wav_for_asr = wav_for_asr.astype('float32')
-                    generated_text = asr_model.transcribe(wav_for_asr,language=lang)["text"].lower()
                     
-                    blue_score = sentence_bleu([text.lower().split()], generated_text.split(), smoothing_function=smoothie)
-                    wer_score = wer(reference=text.lower(), hypothesis=generated_text)
-                    save_scores["blue_scores"].append(blue_score)
-                    save_scores["wer_scores"].append(wer_score)
+                    audios[batch_idx].append(audio_sample)
 
-                    # compute cosine similarities
-                    synth_audio = torch.tensor(wav['wav']).unsqueeze(0).float()
-                    if synth_audio.dim() == 1:
-                        synth_audio = synth_audio.unsqueeze(0)
+                    # File is closed here
+                    wav_for_asr = librosa.resample(audio_sample if isinstance(audio_sample, np.ndarray) else audio_sample.numpy(), 
+                               orig_sr=24000, target_sr=16000)
+                    wav_for_asr_float = wav_for_asr.astype('float32')
+                    generated_text = asr_model.transcribe(wav_for_asr_float, language=lang)["text"].lower()
+                    generated_text = clean_text(generated_text)
+                    text = clean_text(text)
+                    blue_score = bleu.compute(predictions=[generated_text.lower()], references=[[text.lower()]])['score']
+                    
+                    wer_score = wer(reference=text.lower(), hypothesis=generated_text.lower())
 
-                    synth_audio_16k = torchaudio.functional.resample(synth_audio, orig_freq=24000, new_freq=16000)
-                    synth_emb = ecapa(synth_audio_16k.to(device=self.device))
-                    save_scores["target_cosine_similarities"].append(torch.cosine_similarity(tar_emb, synth_emb))
-                    save_scores["reference_cosine_similarities"].append(torch.cosine_similarity(ref_emb, synth_emb))
+
+                    # Compute cosine similarities with batch indexing
+                    synth_emb = ecapa(torch.from_numpy(wav_for_asr).float().unsqueeze(0).to(device=ecapa_device))
+                    # Squeeze all singleton dimensions from synth_emb to get [embedding_dim]
+                    synth_emb = synth_emb.squeeze()
+                    
+                    tar_emb_single = tar_embs[batch_idx].squeeze()  # [192]
+                    ref_emb_single = ref_embs[batch_idx].squeeze()  # [192]
+
+                    tar_cos = torch.cosine_similarity(tar_emb_single.unsqueeze(0), synth_emb.unsqueeze(0)).squeeze().item()
+                    ref_cos = torch.cosine_similarity(ref_emb_single.unsqueeze(0), synth_emb.unsqueeze(0)).squeeze().item()
+                    
+                    # save scores
+                    save_scores["blue_scores"][batch_idx].append(blue_score)
+                    save_scores["wer_scores"][batch_idx].append(wer_score)
+                    save_scores["target_cosine_similarities"][batch_idx].append(tar_cos)
+                    save_scores["reference_cosine_similarities"][batch_idx].append(ref_cos)
                     
                     quality_score = (
-                        0.05 * (1 - wer_score) +
-                        0.05 * blue_score +
-                        0.30 * (1 - save_scores["target_cosine_similarities"][-1]) +
-                        0.60 * save_scores["reference_cosine_similarities"][-1]
+                        0.25 * max(0, 1 - wer_score) +
+                        0.75 * (1 - tar_cos)
                     )
-                    quality_scores.append(quality_score.item())
-                    audios.append(wav['wav'])
+                    quality_scores[batch_idx].append(quality_score if isinstance(quality_score, float) else quality_score.item())
+                    print(f"Sample {batch_idx}, Iteration {i}: BLUE: {blue_score}, WER: {wer_score}, Quality: {quality_scores[batch_idx][-1]}")
 
-                    # compute new audio codes for next iteration
-                    if i < n - 1:
-                        target_sample_rate = 24000 if i > 0 else 22050
-                        o = self.prep_batch(
-                            lang,
-                            text,
-                            f'iteration_{i}',
-                            ref_sample,
-                            train_model,
-                            max_conditioning_length,
-                            min_conditioning_length,
-                            target_hdf5_path=temp_hdf5_path,
-                            ref_hdf5_path=ref_hdf5_path,
-                            target_sample_rate=target_sample_rate
-                        )
-                        audio_codes.append(o["audio_codes"])
+                # compute new audio codes for next iteration
+                if i < n - 1:
+                    next_target_samples = [f'sample_{batch_idx}_iteration_{i}' for batch_idx in range(batch_size)]
+                    o = self.prep_batch_multiple(
+                        langs,
+                        texts,
+                        next_target_samples,
+                        ref_samples,
+                        train_model.to(self.device),
+                        max_conditioning_length,
+                        min_conditioning_length,
+                        target_hdf5_path=temp_hdf5_path,
+                        ref_hdf5_path=ref_hdf5_path,
+                        target_sample_rate=24000
+                    )
+
+                        
                     
         finally:
             # Robust cleanup
@@ -1219,33 +1573,3 @@ class Xtts(BaseTTS):
             ref_audio = torchaudio.functional.resample(ref_audio, orig_freq=sr, new_freq=new_freq)
             return ref_audio
     
-    def weighted_audio_codes(self,audio_codes, bleu_scores, wer_scores, target_cosines, reference_cosines):
-        # Convert scores to tensors
-        bleu = torch.tensor(bleu_scores, dtype=torch.float32)
-        wer = torch.tensor(wer_scores, dtype=torch.float32)
-        target_cos = torch.stack([x.detach().cpu().squeeze() for x in target_cosines])
-        ref_cos = torch.stack([x.detach().cpu().squeeze() for x in reference_cosines])
-
-
-        # Normalize scores (WER: lower is better, so invert)
-        bleu_norm = bleu / bleu.sum() if bleu.sum() > 0 else torch.ones_like(bleu) / len(bleu)
-        wer_norm = (1 - wer) / (1 - wer).sum() if (1 - wer).sum() > 0 else torch.ones_like(wer) / len(wer)
-        target_cos_norm = (1 - target_cos) / (1 - target_cos).sum() if (1 - target_cos).sum() > 0 else torch.ones_like(target_cos) / len(target_cos)
-        ref_cos_norm = ref_cos / ref_cos.sum() if ref_cos.sum() > 0 else torch.ones_like(ref_cos) / len(ref_cos)
-
-        # Combine weights (average, or use your own formula)
-        weights = (bleu_norm + wer_norm + target_cos_norm + ref_cos_norm) / 4
-        weights = (0.1* bleu_norm + 0.1* wer_norm + 0.4* target_cos_norm + 0.4* ref_cos_norm)
-
-
-        finalaudio_code = sum(weight * code for weight, code in zip(weights, audio_codes))
-
-        """ # Stack audio_codes to tensor
-        audio_codes_tensor = torch.stack([ac.detach().cpu() for ac in audio_codes])  # shape: (n, ...)
-        print(audio_codes_tensor)
-
-        # Weighted sum
-        weighted_sum = torch.sum(weights.view(-1, *([1] * (audio_codes_tensor.dim() - 1))) * audio_codes_tensor, dim=0)
-        print(weighted_sum)
-        """
-        return finalaudio_code

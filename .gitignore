@@ -177,3 +177,4 @@ config.json
 vocab.json
 metadata_xtts2_forward_run_large.csv
 *.zip
+development/temp/iter_temp__vuikopz.hdf5

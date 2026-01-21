@@ -11,16 +11,14 @@ import json
 from concurrent.futures import ThreadPoolExecutor
 
 import warnings
-import soundfile as sf
 
 from model_conf import ModelPaths, load_tts_and_trainer
-from development.utils import assess_segment_quality, denoised_temp_file, generate_text_segments_with_whisper, get_unique_temp_filename, iterative_segment_refinement, split_audio
 warnings.filterwarnings("ignore", category=UserWarning, module="torchaudio")
 
 import fcntl
 import time
 import librosa
-
+import argparse
 
 # for speaker similarity
 from huggingface_hub import hf_hub_download
@@ -39,9 +37,27 @@ ecapa2 = torch.jit.load(model_file, map_location=device)
 
 # Word error rate and blue score
 from jiwer import wer
-from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
+from sacrebleu import BLEU
+bleu_scorer = BLEU(effective_order=True)
 
-smoothie = SmoothingFunction().method4
+import re
+import unicodedata
+
+
+def clean_text(text):
+    # Convert to lowercase
+    text = text.lower()
+    # Replace German ß with ss
+    text = text.replace('ß', 'ss')
+    # Replace common Unicode variations (accents, umlauts, etc.)
+
+    text = unicodedata.normalize('NFKD', text)
+    text = ''.join([c for c in text if not unicodedata.combining(c)])
+    # Remove punctuation and keep only word characters and whitespace
+    cleaned = re.sub(r'[^\w\s]', '', text)
+    # Remove extra whitespace
+    cleaned = ' '.join(cleaned.split())
+    return cleaned
 
 """
 Checkpointing functions
@@ -135,27 +151,6 @@ def get_speaker_embedding(audio_pointer,  orig_sr=22050,hdf5_path = None):
 
 
 
-whisper_text_cache = {}
-
-def get_whisper_text(audio_input, asr_model, lang):
-    """
-    audio_input: numpy array or file path string
-    """
-    # Create a unique cache key for numpy arrays
-    if isinstance(audio_input, np.ndarray):
-        cache_key = id(audio_input)
-    else:
-        cache_key = str(audio_input)
-    
-    if cache_key not in whisper_text_cache:
-        try:
-            result = asr_model.transcribe(audio_input, language=lang)["text"].lower()
-            whisper_text_cache[cache_key] = result
-        except Exception as e:
-            whisper_text_cache[cache_key] = ""
-    
-    return whisper_text_cache[cache_key]
-
 def resample_audio_hdf5(store_id, hdf5_path, target_sr=16000,orig_sr=24000):
     """Load and resample audio from HDF5 file"""
     import h5py
@@ -230,62 +225,6 @@ def calc_speaker_similarity(ref_audio_path, ref_sr, anonymized_audio_array,ref_p
         similarity = torch.cosine_similarity(ref_embedding, anonymized_embedding)
         return similarity.item()
 
-def calc_asr_wer_blue(anonymized_wav, target_text,asr_model,lang):
-    if asr_model is None:
-        tqdm.write('ASR model not available')
-        return None, None
-
-    else:
-        # Use Whisper ASR output for both audios
-        wav_for_asr = anonymized_wav.astype('float32')
-
-        anon_transcription = get_whisper_text(wav_for_asr, asr_model,lang)
-
-
-        bleu_score = sentence_bleu([target_text.lower().split()], anon_transcription.lower().split(), smoothing_function=smoothie)
-        wer_score = wer(target_text, anon_transcription)
-
-        return wer_score, bleu_score
-
-def segment_quality_score(asr_model, target_speaker_emb, ref_speaker_emb, anonymized_wav, ecapa_model):
-    if isinstance(anonymized_wav, np.ndarray):
-        anonymized_wav = torch.tensor(anonymized_wav)
-    elif not isinstance(anonymized_wav, torch.Tensor):
-        anonymized_wav = torch.tensor(np.array(anonymized_wav))
-    
-    segment_length = 2 * 24000
-    segments = split_audio(anonymized_wav, segment_length)
-    text_segments = generate_text_segments_with_whisper(asr_model, segments, 24000)
-    temp_files_created = [] 
-    quality_infos = {}
-    quality_scores = []
-
-    for i, (audio_seg, text_seg) in enumerate(zip(segments, text_segments)):
-        segment_file = get_unique_temp_filename(f'_segment_{i}.wav')
-        sf.write(segment_file, audio_seg.detach().cpu().numpy().squeeze(), 24000)
-        temp_files_created.append(segment_file)
-
-        quality_info = assess_segment_quality(
-            audio_seg, text_seg, target_speaker_emb, ref_speaker_emb, asr_model, ecapa_model
-        )
-        quality_infos[i] = quality_info
-        if quality_info is not None:
-                # Combine WER and BLEU into a single quality score for this segment
-                segment_score = (1 - quality_info['wer']) * 0.5 + quality_info['blue'] * 0.5
-                quality_scores.append(segment_score)
-    
-    for temp_file in temp_files_created:
-            try:
-                os.unlink(temp_file)
-            except:
-                pass
-
-    # Combine WER and BLEU into a single quality score
-    quality_score = (1 - quality_info['wer']) * 0.5 + quality_info['blue'] * 0.5
-    return quality_score, quality_infos
-
-
-
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 def process_reference(ref_speaker_id, model, output_dir, train_model, config, model_name, tts, checkpoint_path, df_ref, df_target, ref_hdf5_path, target_hdf5_path):
@@ -294,7 +233,6 @@ def process_reference(ref_speaker_id, model, output_dir, train_model, config, mo
     style: str, one of 'target', 'mixing', 'half_and_half'. Determines the style of voice conversion.\n
     """
     import whisper
-    import soundfile as sf
 
     while True:
         try:
@@ -305,7 +243,7 @@ def process_reference(ref_speaker_id, model, output_dir, train_model, config, mo
             time.sleep(30)  # Wait before retrying
 
     # get whisper
-    asr_model = whisper.load_model("base", device="cuda" if torch.cuda.is_available() else "cpu")
+    asr_model = whisper.load_model("large-v3", device="cuda" if torch.cuda.is_available() else "cpu")
     
     ref_store_ids = df_ref.store_id[df_ref.speaker_id == ref_speaker_id].tolist()
     ref_lang = df_ref.lang[df_ref.speaker_id == ref_speaker_id].iloc[0]
@@ -317,10 +255,12 @@ def process_reference(ref_speaker_id, model, output_dir, train_model, config, mo
     target_speaker_ids = df_target.speaker_id.unique()
 
     for target_speaker_id in tqdm.tqdm(target_speaker_ids, desc=f"{ref_speaker_id} targets"):
-        store_ids = [df_target.store_id[df_target.speaker_id == target_speaker_id].to_list()[0]]  # only use first store id for target speaker
+        store_ids = [df_target.store_id[df_target.speaker_id == target_speaker_id].tolist()[0]]  # only use first store id for target speaker
         for store_id in store_ids:
-            if is_pair_completed(int(ref_speaker_id), f"{int(target_speaker_id)}_{store_id}", checkpoint["completed"]):
-                tqdm.tqdm.write(f"Skipping {int(ref_speaker_id)} -> {int(target_speaker_id)}_{store_id} (already completed)")
+            pair_id = f"{str(int(ref_speaker_id))}_{str(target_speaker_id)}_{store_id}"
+            tqdm.tqdm.write(pair_id)
+            if pair_id in  checkpoint["completed"]:
+                tqdm.tqdm.write(f"Skipping {str(int(ref_speaker_id))} -> {str(int(target_speaker_id))}_{store_id} (already completed)")
                 continue
 
 
@@ -334,12 +274,13 @@ def process_reference(ref_speaker_id, model, output_dir, train_model, config, mo
 
             if target_speaker_id == ref_speaker_id:
                 continue  # skip if target is same as reference 
+            text_row = df_target[df_target.store_id == store_id].text.iloc[0]
 
             if model_name == 'xtts2_forward_iteration':
                 #with denoised_temp_file(target_speakers[0]) as denoised_path:
                 result = model.forward_iteration_hdf5(
                     lang=lan.lower(),
-                    text=df_target.text[df_target.speaker_id == target_speaker_id].iloc[0],
+                    text=text_row,
                     target_sample=target_store_ids,
                     ref_sample=ref_store_ids,
                     train_model=train_model,
@@ -363,32 +304,11 @@ def process_reference(ref_speaker_id, model, output_dir, train_model, config, mo
                 anonymized_wav = anonymized_wav.detach().cpu().numpy().squeeze()
             elif isinstance(anonymized_wav, list):
                 anonymized_wav = np.array(anonymized_wav)
+        
             
-            if model_name == 'xtts2_forward_iteration':
-                out_name = f"{ref_speaker_id}_to_{target_speaker_id}_{target_store_ids}"
-                # Save first audio (iteration 0) to separate HDF5 file
-                iteration_0_hdf5_path = os.path.join(output_dir, "iteration_0_outputs.hdf5")
-                # save first audio only
-                for retry in range(0,5):
-                    try:
-                        with h5py.File(iteration_0_hdf5_path, 'a') as hdf5_iter:
-                            key = f"{ref_speaker_id}_{target_speaker_id}_{target_store_ids}"
-                            if key in hdf5_iter:
-                                del hdf5_iter[key]
-                            hdf5_iter.create_dataset(key, data=result[3][0])
-                            hdf5_iter[key].attrs['sr'] = model.config.audio.output_sample_rate
-                            hdf5_iter[key].attrs['ref_speaker_id'] = ref_speaker_id
-                            hdf5_iter[key].attrs['target_speaker_id'] = target_speaker_id
-                        tqdm.tqdm.write(f"Saved iteration 0 output to HDF5: {iteration_0_hdf5_path}")
-                        break
-                        
-                    except Exception as e:
-                        tqdm.tqdm.write(f"Error saving to HDF5: {e}")
-                        wait_time = 0.5 * (retry + 1)
-                        time.sleep(wait_time)  # wait before retrying
-
+            out_name = f"{str(ref_speaker_id)}_to_{str(target_speaker_id)}_{str(target_store_ids)}"
             iteration_hdf5_path = os.path.join(output_dir, f"outputs.hdf5")
-            key = f"{ref_speaker_id}_to_{target_speaker_id}_{target_store_ids}.wav"
+            key = f"{str(ref_speaker_id)}_to_{str(target_speaker_id)}_{str(target_store_ids)}"
             # save best audio
             try:
                 with h5py.File(iteration_hdf5_path, 'a') as hdf5_iter:
@@ -404,12 +324,7 @@ def process_reference(ref_speaker_id, model, output_dir, train_model, config, mo
 
             
             
-            
-            best_out_name = f"{ref_speaker_id}_to_{target_speaker_id}_{target_store_ids}_best.wav"
-            out_path = os.path.join(output_dir, best_out_name)     
-            sf.write(out_path, anonymized_wav, model.config.audio.output_sample_rate)
-            tqdm.tqdm.write(f"Saved: {out_path}")
-
+    
             anonymized_wav_res = librosa.resample(anonymized_wav, orig_sr=24000, target_sr=16000)
 
             speaker_similarity_an_ref = calc_speaker_similarity(ref_store_ids, 22050, anonymized_wav_res, ref_hdf5_path)
@@ -417,9 +332,32 @@ def process_reference(ref_speaker_id, model, output_dir, train_model, config, mo
             tqdm.tqdm.write(f"Speaker Similarity (Anonymized vs Ref): {speaker_similarity_an_ref:.4f}")
             tqdm.tqdm.write(f"Speaker Similarity (Anonymized vs Target): {speaker_similarity_an_target:.4f}")
 
-            target_text = df_target.text[df_target.speaker_id == target_speaker_id].iloc[0]
+            for i in range(3):
+                try:
+                    generated_text = asr_model.transcribe(anonymized_wav_res,language=lan)['text']
+                    if generated_text != None:
+                        break
+                except Exception as e:
+                    tqdm.tqdm.write(f"Error in ASR transcription: {e}")
+                    generated_text = ""
+                    time.sleep(1)  # wait before retrying
+            
+            text_row = clean_text(text_row)
+            generated_text = clean_text(generated_text)
 
-            wer_score, bleu_score = calc_asr_wer_blue(anonymized_wav_res, target_text, asr_model,lan)
+            try:
+                wer_score = wer(text_row, generated_text)
+            except Exception as e:
+                tqdm.tqdm.write(f"Error computing WER: {e}")
+                wer_score = 1.0  # Assign worst score on error
+                time.sleep(1)  # wait before retrying
+
+            try:
+                bleu_score = bleu_scorer.sentence_score(generated_text,[text_row])["score"]/100.0
+                print(bleu_score , flush=True)
+            except Exception as e:
+                tqdm.tqdm.write(f"Error computing BLEU: {e}")
+                bleu_score = 0.0  # Assign worst score on error
 
             tqdm.tqdm.write(f"WER: {wer_score}")
             tqdm.tqdm.write(f"BLEU: {bleu_score}")
@@ -428,19 +366,21 @@ def process_reference(ref_speaker_id, model, output_dir, train_model, config, mo
             
 
             local_metadata.append({
-                "ref_file": int(ref_speaker_id),  # Convert NumPy int64 to Python int
-                "target_file": int(target_speaker_id),  # Convert NumPy int64 to Python int
+                "ref_file": str(int(ref_speaker_id)),  
+                "target_file": str(int(target_speaker_id)), 
                 "output_file": out_name,
-                "output_path": out_path,
+                "output_path": key,
                 "WER": float(wer_score),  # Convert to Python float
                 "BLEU": float(bleu_score),  # Convert to Python float
                 "speaker_similarity_an_ref": float(speaker_similarity_an_ref),
                 "speaker_similarity_an_target": float(speaker_similarity_an_target),
                 "language": str(lan),  # Convert to Python str
-                "orig_target_path": f"{target_store_ids}",  
+                "orig_target_path": f"{str(target_store_ids)}",
+                'generated_text':generated_text,
+                'target_text':text_row
             })
-            # ADD THIS: Mark this pair as completed and save checkpoint
-            pair_id = f"{int(ref_speaker_id)}_{int(target_speaker_id)}_{store_id}"
+            # ADD THIS: str this pair as completed and save checkpoint
+            
             # dont just fail the whole process if file already open
             while True:
                 try:
@@ -455,9 +395,7 @@ def process_reference(ref_speaker_id, model, output_dir, train_model, config, mo
     return local_metadata
 
 def main(model_name: str, output_dir: str, name:str , ref_hdf5_path: str  , target_hdf5_path: str, ref_df = None, target_df = None,csv_output_dir: str = './csv_output/' ):
-    if ref_df is None and target_df is None:
-        ref_df = pd.read_csv('/data/train/metadata/metadata/result/100speaker_perlang.csv')
-        target_df = pd.read_csv('/data/train/metadata/metadata/result/100speaker_perlang.csv')
+    
     os.makedirs(csv_output_dir, exist_ok=True)
 
     refernce_speaker_ids = ref_df.speaker_id.unique()
@@ -489,7 +427,26 @@ def main(model_name: str, output_dir: str, name:str , ref_hdf5_path: str  , targ
 
 
 if __name__ == "__main__":
-    output_dir = "/home/romolo/VT1/prog/streamlit_prog/outputs/"
-    main("xtts2_forward_iteration", output_dir, name=f'search_speaker_on_train_test',ref_hdf5_path='/data/train/audios/destination.hdf5', target_hdf5_path='/data/train/audios/destination.hdf5',csv_output_dir=os.path.join(output_dir,'csv_outputs'))
-    """output_dir = os.getenv('OUTPUT_PATH') if 'OUTPUT_PATH' in os.environ else '/cluster/home/muletrom/result/'
-    main("xtts2_forward_iteration", output_dir, name=f'search_speaker_on_train',ref_hdf5_path='/cluster/home/muletrom/data/destination.hdf5', target_hdf5_path='/cluster/home/muletrom/data/destination.hdf5',csv_output_dir=os.path.join(output_dir,'csv_outputs'))"""
+    parser = argparse.ArgumentParser(description='Run TTS anonymization')
+    parser.add_argument('--languages', nargs='+', default=['de', 'en'], 
+                        help='Languages to process (default: de en)')
+    lang_str = '_'.join(parser.parse_args().languages)
+    
+    args = parser.parse_args()
+
+    ref_df = pd.read_csv('/cluster/home/muletrom/result/100speaker_perlang.csv')
+    target_df = pd.read_csv('/cluster/home/muletrom/result/100speaker_perlang.csv')
+    ref_df = ref_df[ref_df['lang'].isin(args.languages)]
+    target_df = target_df[target_df['lang'].isin(args.languages)]
+    print(f"Reference DF shape: {ref_df.shape}", flush=True)
+    print(f"Target DF shape: {target_df.shape}", flush=True)
+    
+    output_dir = os.getenv('OUTPUT_PATH') if 'OUTPUT_PATH' in os.environ else '/cluster/home/muletrom/result/'
+    print(f"Using output directory: {output_dir}", flush=True)
+    main("xtts2_forward_iteration", 
+        output_dir, 
+        name=f'search_speaker_on_train_{lang_str}',
+        ref_hdf5_path='/cluster/home/muletrom/data/destination.hdf5', 
+        target_hdf5_path='/cluster/home/muletrom/data/destination.hdf5',
+        ref_df=ref_df, target_df=target_df,
+        csv_output_dir=os.path.join(output_dir,'csv_outputs'))

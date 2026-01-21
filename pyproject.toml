@@ -6,11 +6,14 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "anyascii>=0.3.3",
+    "argparse>=1.4.0",
     "bangla>=0.0.5",
     "bnnumerizer>=0.0.2",
     "bnunicodenormalizer>=0.1.7",
     "coqpit>=0.0.17",
+    "datasets>=4.4.1",
     "einops>=0.8.1",
+    "evaluate>=0.4.6",
     "faster-whisper>=1.2.0",
     "gradio>=5.49.1",
     "gruut>=2.4.0",
@@ -30,6 +33,7 @@ dependencies = [
     "pandas>=2.3.3",
     "pypinyin>=0.55.0",
     "pysbd>=0.3.4",
+    "sacrebleu>=2.5.1",
     "soundfile>=0.13.1",
     "spacy>=3.8.7",
     "torch==2.6",

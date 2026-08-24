@@ -1,0 +1,69 @@
+# Example configuration for the speaker anonymizer.
+#
+#   anonymize run input.wav --config anonymizer.example.yaml -o out.wav
+#
+# Every option is optional. Precedence, highest first:
+#   CLI flag  >  this file  >  environment variable  >  built-in default
+# Delete anything you do not want to override.
+
+# --- model -------------------------------------------------------------------
+
+# Directory holding the XTTS v2 checkpoints (model.pth, dvae.pth, mel_stats.pth,
+# vocab.json, config.json). Get them with `anonymize download-model`.
+# Env: XTTS_MODEL_DIR
+model_dir: ./XTTS_v2.0_original_model_files
+
+# "cuda" or "cpu". Omit to auto-detect. CPU works but is very slow.
+# Env: ANONYMIZER_DEVICE
+# device: cuda
+
+# --- what to run -------------------------------------------------------------
+
+# How hard to work for quality:
+#   single   one pass. Seconds per file. The reliable default.
+#   refine   split the output into segments, rescore each, regenerate the weak ones.
+#            Minutes per file, wants a GPU. Tune with threshold/max_attempts.
+#   iterate  run `iterations` full passes, each fed the previous output, keep the
+#            best-scoring one. Minutes per file, wants a GPU.
+# Env: ANONYMIZER_MODE
+mode: single
+
+# Two-letter language code of the input speech. Getting this wrong garbles the
+# transcript and therefore the output.
+language: en
+
+# Whisper size used to transcribe the input when no text is supplied.
+# base is fast and usually enough; large-v3 is markedly better and much slower.
+# Env: ANONYMIZER_WHISPER_MODEL
+whisper_model: base
+
+# --- quality knobs -----------------------------------------------------------
+
+# mode: iterate — how many passes to run before picking the best.
+iterations: 5
+
+# mode: refine — segment quality below which a segment is regenerated (0-1).
+threshold: 0.6
+
+# mode: refine — regeneration attempts per weak segment.
+max_attempts: 10
+
+# --- input / output ----------------------------------------------------------
+
+# Run noise reduction on the input before anonymizing. Helps on noisy recordings,
+# can hurt on clean ones.
+denoise: false
+
+# Sample rate of the written wav. The model itself emits 24000; anything else is
+# resampled on the way out.
+output_sample_rate: 24000
+
+# Default donor voice — the speaker the output will sound like. A wav file, a
+# directory of wavs (conditioning is averaged across them), or a comma-separated
+# list. Overridden by --reference.
+# reference: ./voices/donor_01.wav
+
+# Directory of donor voices used when no reference is given at all. Leave unset to
+# require an explicit --reference.
+# Env: ANONYMIZER_VOICE_POOL
+# voice_pool_dir: ./voices

@@ -38,15 +38,20 @@ def stitch_segments(segments):
     return torch.cat(segments, dim=-1)
 
 def get_unique_temp_filename(suffix='.wav'):
-    """Generate a unique temporary filename"""
+    """Generate a unique temporary filename in the system temp dir.
+
+    Returns an absolute path so callers do not litter their working directory.
+    """
     timestamp = str(int(time.time() * 1000000))  # Microsecond timestamp
     thread_id = str(threading.get_ident())
     unique_id = str(uuid.uuid4())[:8]
-    return f"temp_{timestamp}_{thread_id}_{unique_id}{suffix}"
+    return os.path.join(tempfile.gettempdir(), f"temp_{timestamp}_{thread_id}_{unique_id}{suffix}")
 
-def assess_segment_quality(segment_audio, segment_text, target_speaker_emb, ref_speaker_emb, asr_model, ecapa_model):
+def assess_segment_quality(segment_audio, segment_text, target_speaker_emb, ref_speaker_emb, asr_model, ecapa_model, device=None):
     """Assess quality of a single segment"""
-    
+    if device is None:
+        device = next(ecapa_model.parameters()).device
+
     # Convert to numpy for ASR processing
     audio_np = segment_audio.detach().cpu().numpy().squeeze()
     smoothie = SmoothingFunction().method4
@@ -72,7 +77,7 @@ def assess_segment_quality(segment_audio, segment_text, target_speaker_emb, ref_
     try:
         # Resample segment audio to 16kHz for ECAPA
         segment_16k = resample_audio_16k(segment_audio, orig_freq=24000, new_freq=16000)
-        segment_emb = ecapa_model(segment_16k.to(device="cuda"))
+        segment_emb = ecapa_model(segment_16k.to(device=device))
         
         target_sim = torch.cosine_similarity(target_speaker_emb, segment_emb).item()
         ref_sim = torch.cosine_similarity(ref_speaker_emb, segment_emb).item()
@@ -294,7 +299,9 @@ def regenerate_segment_multiple_attempts(model, text_seg, segment_file, ref_spea
     
     return best_segment, best_quality, best_scores
 
-def iterative_segment_refinement(model, target_speaker, ref_speaker, max_conditioning_length, min_conditioning_length, train_model, asr_model, ecapa_model, lang='en', threshold=0.7, max_attempts=3,regenerate=False,debug=False):
+def iterative_segment_refinement(model, target_speaker, ref_speaker, max_conditioning_length, min_conditioning_length, train_model, asr_model, ecapa_model, lang='en', threshold=0.7, max_attempts=3,regenerate=False,debug=False, device=None):
+    if device is None:
+        device = next(ecapa_model.parameters()).device
     # Step 1: Load target audio to get text and for embeddings
     target_audio = load_audio(target_speaker, 24000)
     text = asr_model.transcribe(target_speaker)['text']
@@ -313,11 +320,11 @@ def iterative_segment_refinement(model, target_speaker, ref_speaker, max_conditi
     
     # Get speaker embeddings for comparison
     target_audio_16k = resample_audio_16k(torch.tensor(target_audio), orig_freq=24000, new_freq=16000)
-    ref_audio = load_audio(ref_speaker[0], 24000)
+    ref_audio = load_audio(ref_speaker if isinstance(ref_speaker, str) else ref_speaker[0], 24000)
     ref_audio_16k = resample_audio_16k(torch.tensor(ref_audio), orig_freq=24000, new_freq=16000)
-    
-    target_speaker_emb = ecapa_model(target_audio_16k.to("cuda"))
-    ref_speaker_emb = ecapa_model(ref_audio_16k.to("cuda"))
+
+    target_speaker_emb = ecapa_model(target_audio_16k.to(device))
+    ref_speaker_emb = ecapa_model(ref_audio_16k.to(device))
 
     # Step 2: Split into 3-second segments
     segment_length = 2 * 24000

@@ -178,3 +178,9 @@ vocab.json
 metadata_xtts2_forward_run_large.csv
 *.zip
 development/temp/iter_temp__vuikopz.hdf5
+
+# Anonymizer: downloaded XTTS v2 checkpoints (~2 GB) and run artifacts
+XTTS_v2.0_original_model_files/
+anonymize_checkpoint.json
+anonymize_checkpoint.json.lock
+temp/

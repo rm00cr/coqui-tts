@@ -16,13 +16,30 @@ from TTS.tts.layers.xtts.tokenizer import VoiceBpeTokenizer, split_sentence
 from TTS.tts.layers.xtts.xtts_manager import SpeakerManager, LanguageManager
 from TTS.tts.models.base_tts import BaseTTS
 from TTS.utils.io import load_fsspec
-from jiwer import wer
 import re
-from sacrebleu import BLEU
-bleu_scorer = BLEU(effective_order=True)
-import h5py
 import numpy as np
 import unicodedata
+
+# Scoring backends (jiwer, sacrebleu) and h5py are imported lazily so that merely
+# importing this module does not pull in the evaluation stack. Only the iterative
+# forward_* methods and the HDF5 loaders need them.
+_bleu_scorer = None
+
+
+def _get_bleu_scorer():
+    global _bleu_scorer
+    if _bleu_scorer is None:
+        from sacrebleu import BLEU
+
+        _bleu_scorer = BLEU(effective_order=True)
+    return _bleu_scorer
+
+
+def wer(reference, hypothesis):
+    """Word error rate. Thin shim over jiwer, imported on first use."""
+    from jiwer import wer as _wer
+
+    return _wer(reference=reference, hypothesis=hypothesis)
 
 init_stream_support()
 
@@ -122,6 +139,8 @@ def load_audio(audiopath, orig_sr, hdf5_path=None):
 
 
 def load_audio_hdf5(hdf5_path, file_key):
+        import h5py
+
         with h5py.File(hdf5_path, "r") as hdf5_file:
             audio = hdf5_file[file_key][:]
         audio_tensor = torch.FloatTensor(audio)
@@ -1190,7 +1209,20 @@ class Xtts(BaseTTS):
             tts,
             ecapa,
             asr_model,
-            n = 5):
+            n = 5,
+            output_dir = None):
+        """Iteratively resynthesize the target in the reference voice, scoring each pass.
+
+        Each iteration feeds the previous output back in as the target, so the speaker
+        identity drifts further from the original with every pass. Returns
+        ``(save_wavs, save_scores, quality_scores, audios)``; callers typically pick
+        ``audios[argmax(quality_scores)]``.
+
+        Args:
+            output_dir: where per-iteration wavs are written. When ``None`` a temporary
+                directory is used and removed on return, so the paths in ``save_wavs``
+                are only valid for the duration of the call.
+        """
 
         # for score calculation pre calculate target and ref embeddings
         target_audio = self.resample_audio_16k(target_sample)
@@ -1210,88 +1242,98 @@ class Xtts(BaseTTS):
         )
         
 
+        import shutil
+        import tempfile
+        import time
+
+        import tqdm
+
+        # Per-iteration wavs go to a caller-supplied dir, or a private scratch dir that is
+        # removed on return. A scratch dir per call also keeps concurrent workers from
+        # colliding on the same iterate_output_{i}.wav filenames.
+        scratch_dir = output_dir if output_dir is not None else tempfile.mkdtemp(prefix="xtts_iter_")
+        os.makedirs(scratch_dir, exist_ok=True)
+
         save_wavs =  {}
         save_scores = {"bleu_scores": [], "wer_scores": [],"target_cosine_similarities": [],"reference_cosine_similarities": []}
         audio_codes = []
         quality_scores = []
         audios = []
 
-        for i in range(0, n):
-            
-            wav = self.forward(o, ref_sample, train_model)
+        # Score against a normalized copy of the prompt; `text` itself must stay intact
+        # because it conditions every subsequent iteration.
+        reference_text = clean_text(text).lower()
 
-            # save wav path for each iteration
-            tts.synthesizer.save_wav(wav=wav['wav'], path=f"/home/romolo/VT1/coqui-tts/data/outputs/models/iterate_output_{i}.wav")
+        try:
+            for i in range(0, n):
 
-            # save wav path for each iteration          
-            save_wavs[f"wav_{i}"] = f"/home/romolo/VT1/coqui-tts/data/outputs/models/iterate_output_{i}.wav"
+                wav = self.forward(o, ref_sample, train_model)
 
-            # compute scores
-            wav_for_asr = librosa.resample(wav['wav'], orig_sr=24000, target_sr=16000)
-            #wav_for_asr_float = wav_for_asr.astype('float32')
-            
-            for i in range(3):
+                # save wav path for each iteration
+                iter_path = os.path.join(scratch_dir, f"iterate_output_{i}.wav")
+                tts.synthesizer.save_wav(wav=wav['wav'], path=iter_path)
+                save_wavs[f"wav_{i}"] = iter_path
+
+                # compute scores
+                wav_for_asr = librosa.resample(wav['wav'], orig_sr=24000, target_sr=16000)
+
+                generated_text = ""
+                for attempt in range(3):
+                    try:
+                        generated_text = asr_model.transcribe(wav_for_asr, language=lang)['text']
+                        if generated_text is not None:
+                            break
+                    except Exception as e:
+                        tqdm.tqdm.write(f"Error in ASR transcription: {e}")
+                        generated_text = ""
+                        time.sleep(1)  # wait before retrying
+                generated_text = clean_text(generated_text or "").lower()
+
                 try:
-                    generated_text = asr_model.transcribe(anonymized_wav_res,language=lan)['text']
-                    if generated_text != None:
-                        break
+                    wer_score = wer(reference=reference_text, hypothesis=generated_text)
                 except Exception as e:
-                    tqdm.tqdm.write(f"Error in ASR transcription: {e}")
-                    generated_text = ""
-                    time.sleep(1)  # wait before retrying
-            
-    
-            try:
-                wer_score = wer(text, generated_text)
-                break
-            except Exception as e:
-                tqdm.tqdm.write(f"Error computing WER: {e}")
-                wer_score = 1.0  # Assign worst score on error
-                time.sleep(1)  # wait before retrying
-            
+                    tqdm.tqdm.write(f"Error computing WER: {e}")
+                    wer_score = 1.0  # Assign worst score on error
 
-            try:
-                bleu_score = bleu_scorer.sentence_score(generated_text,[text])["score"]/100.0
-                break
-            except Exception as e:
-                tqdm.tqdm.write(f"Error computing BLEU: {e}")
-                bleu_score = 0.0  # Assign worst score on error
-  # wait before retrying
+                try:
+                    bleu_score = _get_bleu_scorer().sentence_score(generated_text,[reference_text]).score/100.0
+                except Exception as e:
+                    tqdm.tqdm.write(f"Error computing BLEU: {e}")
+                    bleu_score = 0.0  # Assign worst score on error
 
+                save_scores["bleu_scores"].append(bleu_score)
+                save_scores["wer_scores"].append(wer_score)
 
-
-            save_scores["bleu_scores"].append(bleu_score)
-            save_scores["wer_scores"].append(wer_score)
-
-            # compute cosine similarities
-            synth_audio = self.resample_audio_16k(f"/home/romolo/VT1/coqui-tts/data/outputs/models/iterate_output_{i}.wav")
-
-            synth_emb = ecapa(synth_audio.to(device=self.device))
-            save_scores["target_cosine_similarities"].append(torch.cosine_similarity(tar_emb, synth_emb))
-            save_scores["reference_cosine_similarities"].append(torch.cosine_similarity(ref_emb, synth_emb))
-            print(f"Iteration {i}: BLEU: {bleu_score}, WER: {wer_score}, Target Cosine: {save_scores['target_cosine_similarities'][-1]}, Reference Cosine: {save_scores['reference_cosine_similarities'][-1]}")
-            quality_score = (
-                0.05 * (1 - wer_score) +          # Lower WER is better
-                0.05 * bleu_score +               # Higher BLEU is better
-                0.30 * (1 - save_scores["target_cosine_similarities"][-1]) +         # Lower target similarity is better (voice conversion)
-                0.60 * save_scores["reference_cosine_similarities"][-1]                    # Higher ref similarity is better
-            )
-            quality_scores.append(quality_score.item())
-            audios.append(wav['wav'])
-
-            # compute new audio codes for next iteration
-            if i < n -1:
-                o = self.prep_batch(
-                lang,
-                text,
-                f"/home/romolo/VT1/coqui-tts/data/outputs/models/iterate_output_{i}.wav",
-                ref_sample,
-                train_model.to(self.device),
-                max_conditioning_length,
-                min_conditioning_length
+                # compute cosine similarities against the audio we just generated
+                synth_emb = ecapa(torch.from_numpy(wav_for_asr).float().unsqueeze(0).to(device=ecapa_device))
+                save_scores["target_cosine_similarities"].append(torch.cosine_similarity(tar_emb, synth_emb))
+                save_scores["reference_cosine_similarities"].append(torch.cosine_similarity(ref_emb, synth_emb))
+                print(f"Iteration {i}: BLEU: {bleu_score}, WER: {wer_score}, Target Cosine: {save_scores['target_cosine_similarities'][-1]}, Reference Cosine: {save_scores['reference_cosine_similarities'][-1]}")
+                quality_score = (
+                    0.05 * (1 - wer_score) +          # Lower WER is better
+                    0.05 * bleu_score +               # Higher BLEU is better
+                    0.30 * (1 - save_scores["target_cosine_similarities"][-1]) +         # Lower target similarity is better (voice conversion)
+                    0.60 * save_scores["reference_cosine_similarities"][-1]                    # Higher ref similarity is better
                 )
+                quality_scores.append(float(quality_score))
+                audios.append(wav['wav'])
 
-                audio_codes.append(o["audio_codes"])
+                # feed this iteration's output back in as the target for the next one
+                if i < n - 1:
+                    o = self.prep_batch(
+                    lang,
+                    text,
+                    iter_path,
+                    ref_sample,
+                    train_model.to(self.device),
+                    max_conditioning_length,
+                    min_conditioning_length
+                    )
+
+                    audio_codes.append(o["audio_codes"])
+        finally:
+            if output_dir is None:
+                shutil.rmtree(scratch_dir, ignore_errors=True)
 
         return save_wavs, save_scores, quality_scores, audios
    
@@ -1339,7 +1381,8 @@ class Xtts(BaseTTS):
         
         import tempfile
         import time
-        
+        import h5py
+
         PROJECT_TEMP_DIR = os.getenv("PROJECT_TEMP_DIR", "./temp/")
         os.makedirs(PROJECT_TEMP_DIR, exist_ok=True)
         temp_hdf5_fd, temp_hdf5_path = tempfile.mkstemp(suffix='.hdf5', prefix='iter_temp_', dir=PROJECT_TEMP_DIR)
@@ -1353,10 +1396,10 @@ class Xtts(BaseTTS):
                 wav = self.forward(o, ref_sample, train_model, ref_hdf5_path=ref_hdf5_path)
 
                 # Ensure file handle is properly closed by using context manager
-                for i in range(3):
+                iter_key = f'iteration_{i}'
+                for attempt in range(3):
                     try:
                         with h5py.File(temp_hdf5_path, 'a') as hdf5_temp:
-                            iter_key = f'iteration_{i}'
                             if iter_key in hdf5_temp:
                                 del hdf5_temp[iter_key]
                             hdf5_temp.create_dataset(iter_key, data=wav['wav'])
@@ -1374,7 +1417,7 @@ class Xtts(BaseTTS):
                 generated_text = clean_text(generated_text).lower()
                 text = clean_text(text).lower()
                 try:
-                    bleu_score = bleu_scorer.sentence_score(generated_text,[text]).score/100.0
+                    bleu_score = _get_bleu_scorer().sentence_score(generated_text,[text]).score/100.0
                 except:
                     bleu_score = 0.0
                 try:
@@ -1509,7 +1552,8 @@ class Xtts(BaseTTS):
         
         import tempfile
         import time
-        
+        import h5py
+
         PROJECT_TEMP_DIR = os.getenv("PROJECT_TEMP_DIR", "./temp/")
         os.makedirs(PROJECT_TEMP_DIR, exist_ok=True)
         temp_hdf5_fd, temp_hdf5_path = tempfile.mkstemp(suffix='.hdf5', prefix='iter_temp_', dir=PROJECT_TEMP_DIR)
@@ -1550,8 +1594,8 @@ class Xtts(BaseTTS):
                     generated_text = asr_model.transcribe(wav_for_asr_float, language=lang)["text"].lower()
                     generated_text = clean_text(generated_text)
                     text = clean_text(text)
-                    bleu_score = bleu_scorer.sentence_score(generated_text,[text])["score"]/100.0
-                    
+                    bleu_score = _get_bleu_scorer().sentence_score(generated_text,[text]).score/100.0
+
                     wer_score = wer(reference=text.lower(), hypothesis=generated_text.lower())
 
 
@@ -1616,6 +1660,8 @@ class Xtts(BaseTTS):
         """
         # if h5py path is given load from hdf5 file
         if hdf5_path is not None:
+            import h5py
+
             with h5py.File(hdf5_path, 'r') as hdf5_file:
                 ref_audio = torch.tensor(hdf5_file[audiopath][:])
                 # Try to get sample rate from attributes, otherwise use orig_freq parameter

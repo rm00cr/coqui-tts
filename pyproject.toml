@@ -1,10 +1,11 @@
 [project]
 name = "coqui-tts"
 version = "0.1.0"
-description = "Add your description here"
+description = "Speaker anonymization for speech, built on Coqui XTTS v2"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "pyyaml>=6.0",
     "anyascii>=0.3.3",
     "argparse>=1.4.0",
     "bangla>=0.0.5",
@@ -42,7 +43,18 @@ dependencies = [
     "transformers==4.33",
 ]
 
+[project.scripts]
+anonymize = "anonymizer.cli:main"
 
+[tool.pytest.ini_options]
+markers = [
+    "slow: needs a GPU and/or downloads extra models; deselect with -m 'not slow'",
+]
+
+[tool.setuptools]
+# TTS is the upstream Coqui package; anonymizer is the public API for this fork;
+# development carries the refinement heuristics anonymizer's "refine" mode calls.
+packages = ["TTS", "anonymizer", "development"]
 
 [build-system]
 requires = [

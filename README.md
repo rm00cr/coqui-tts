@@ -1,3 +1,64 @@
+# Speaker anonymization with XTTS v2
+
+This is a fork of [Coqui TTS](https://github.com/coqui-ai/TTS) that adds a **speaker
+anonymization** pipeline: give it a recording and a donor voice, and it returns the same
+words spoken in the donor's voice, so the original speaker's identity is not recoverable
+from the audio. The transcript is preserved verbatim — this hides *who* is speaking, not
+*what* was said.
+
+**→ [ANONYMIZATION.md](ANONYMIZATION.md) is the documentation for this fork.**
+It covers install, the CLI, batch processing, quality modes, config and limitations.
+[examples/quickstart.ipynb](examples/quickstart.ipynb) is the same thing as a notebook.
+
+### Install
+
+```bash
+uv sync                       # or: pip install -e .
+anonymize download-model      # ~2 GB of XTTS v2 checkpoints, once
+```
+
+### Command line
+
+The install puts an `anonymize` command on your path:
+
+```bash
+anonymize run interview.wav --reference donor.wav -o interview_anon.wav
+anonymize run interview.wav --reference donor.wav -o out.wav --score --mode iterate
+anonymize batch recordings/ --reference donor.wav -o anonymized/ --resume
+anonymize config --show                       # the resolved configuration
+```
+
+Defaults come from `anonymizer.example.yaml` (copy it, edit it, pass `--config`) or from
+`XTTS_MODEL_DIR` / `ANONYMIZER_*` environment variables; CLI flags win over both.
+
+### Python
+
+```python
+from anonymizer import Anonymizer
+
+anon = Anonymizer()                                    # nothing loaded yet
+result = anon.anonymize("interview.wav", reference="donor.wav")
+
+anon.save(result, "interview_anon.wav")
+print(result.text)                                     # the transcript it worked from
+print(anon.score(result, "interview.wav").to_dict())   # WER, BLEU, speaker similarity
+```
+
+### What the fork adds
+
+| | |
+|---|---|
+| `anonymizer/` | the pipeline and its public API — `Anonymizer`, config, voices, scoring, batch, CLI |
+| `development/` | segment-level refinement heuristics, now a real package so it ships with an install |
+| `TTS/tts/models/xtts.py` | anonymization entry points on `Xtts` (`forward_from_audios_and_text`, `prep_batch`, `forward_iteration`) |
+| `tests/anonymizer_tests/` | unit tests that need no model weights, plus end-to-end tests that skip without checkpoints |
+| `model_conf.py` | shim kept for existing scripts; the code moved to `anonymizer/model_setup.py` |
+
+Everything below is the upstream Coqui TTS README, which still applies to the underlying
+`TTS` package.
+
+______________________________________________________________________
+
 
 ## 🐸Coqui.ai News
 - 📣 ⓍTTSv2 is here with 16 languages and better performance across the board.

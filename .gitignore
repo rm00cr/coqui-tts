@@ -173,10 +173,13 @@ local_scripts/*
 coqui_demos/*
 
 *.wav
-# ...except the quickstart sample pair (~460 KB), so a fresh clone can run
-# examples/quickstart.ipynb without hunting for audio.
+# ...except the quickstart sample pair (~460 KB) and the five-speaker demo voice pool
+# (~4.7 MB, Common Voice, CC-0), so a fresh clone can run examples/quickstart.ipynb
+# without hunting for audio.
 !data/TARGET_5s.wav
 !data/REF.wav
+!data/pool/
+!data/pool/**/*.wav
 ./test_data/*
 config.json
 vocab.json

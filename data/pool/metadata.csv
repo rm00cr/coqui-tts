@@ -1,0 +1,16 @@
+path,speaker_id,gender,language
+DE_414560/common_voice_de_41456000.wav,DE_414560,male,de
+DE_414560/common_voice_de_41456001.wav,DE_414560,male,de
+DE_414560/common_voice_de_41456002.wav,DE_414560,male,de
+DE_414863/common_voice_de_41486308.wav,DE_414863,,de
+DE_414863/common_voice_de_41486309.wav,DE_414863,,de
+DE_414863/common_voice_de_41486310.wav,DE_414863,,de
+FR_413330/common_voice_fr_41333036.wav,FR_413330,female,fr
+FR_413330/common_voice_fr_41333037.wav,FR_413330,female,fr
+FR_413330/common_voice_fr_41333038.wav,FR_413330,female,fr
+FR_414927/common_voice_fr_41492784.wav,FR_414927,,fr
+FR_414927/common_voice_fr_41492785.wav,FR_414927,,fr
+FR_414927/common_voice_fr_41492786.wav,FR_414927,,fr
+IT_416773/common_voice_it_41677304.wav,IT_416773,female,it
+IT_416773/common_voice_it_41677305.wav,IT_416773,female,it
+IT_416773/common_voice_it_41677306.wav,IT_416773,female,it

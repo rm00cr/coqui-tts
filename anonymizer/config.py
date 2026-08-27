@@ -14,13 +14,16 @@ from typing import Any, Optional
 #: Anonymization strategies, cheapest first. See `anonymizer.modes` for what each runs.
 MODES = ("single", "refine", "iterate")
 
+#: Donor-choosing strategies. See `anonymizer.selection`.
+SELECTION_STRATEGIES = ("most_distant", "none")
+
 #: Environment variable fallbacks, applied when a field is not set explicitly or in YAML.
 _ENV_VARS = {
     "model_dir": "XTTS_MODEL_DIR",
     "device": "ANONYMIZER_DEVICE",
     "mode": "ANONYMIZER_MODE",
     "whisper_model": "ANONYMIZER_WHISPER_MODEL",
-    "voice_pool_dir": "ANONYMIZER_VOICE_POOL",
+    "voice_pool": "ANONYMIZER_VOICE_POOL",
 }
 
 #: Applied after the environment, for fields that would otherwise need a non-None default.
@@ -29,6 +32,7 @@ _ENV_VARS = {
 _FALLBACKS = {
     "mode": "single",
     "whisper_model": "base",
+    "selection": "most_distant",
 }
 
 
@@ -52,8 +56,17 @@ class AnonymizerConfig:
         output_sample_rate: sample rate of the written wav. The model emits 24 kHz.
         reference: default donor voice. A wav path, a directory of wavs, or a
             comma-separated list. Required unless supplied per call.
-        voice_pool_dir: directory of bundled donor voices used when no reference is
-            given. Unset by default; see `anonymizer.voices`.
+        voice_pool: pool of donor voices to choose from when no reference is given —
+            a directory (``pool/<speaker>/*.wav``) or a CSV manifest with an audio-path
+            column and, ideally, speaker_id/gender/language columns. One donor is picked
+            per target; see `selection`. Env: ANONYMIZER_VOICE_POOL.
+        selection: how to pick a donor out of `voice_pool`. "most_distant" (the default)
+            chooses the pool speaker whose voice is furthest from the target's, which is
+            what makes the anonymization strong. "none" falls back to averaging the whole
+            pool, as before.
+        select_top_k: how many of the chosen speaker's clips to condition on.
+        voice_pool_dir: legacy — a flat directory of donor voices, all of which are
+            averaged together with no selection. Prefer `voice_pool`.
     """
 
     model_dir: Optional[str] = None
@@ -67,6 +80,9 @@ class AnonymizerConfig:
     denoise: bool = False
     output_sample_rate: int = 24000
     reference: Optional[str] = None
+    voice_pool: Optional[str] = None
+    selection: Optional[str] = None      # -> "most_distant"; see _FALLBACKS
+    select_top_k: int = 10
     voice_pool_dir: Optional[str] = None
 
     def __post_init__(self):
@@ -93,6 +109,15 @@ class AnonymizerConfig:
 
         if self.mode not in MODES:
             raise ValueError(f"mode must be one of {MODES}, got {self.mode!r}")
+
+        if self.selection not in SELECTION_STRATEGIES:
+            raise ValueError(
+                f"selection must be one of {SELECTION_STRATEGIES}, got {self.selection!r}"
+            )
+
+        self.select_top_k = int(self.select_top_k)
+        if self.select_top_k < 1:
+            raise ValueError(f"select_top_k must be at least 1, got {self.select_top_k}")
 
         self.iterations = int(self.iterations)
         self.max_attempts = int(self.max_attempts)

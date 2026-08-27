@@ -55,6 +55,24 @@ def load_wav(path: str, sample_rate: Union[int, None] = None):
     return wav.astype(np.float32), sr
 
 
+def load_16k_mono(path: str):
+    """Load an audio file as the mono 16 kHz tensor ECAPA2 expects, shaped [1, samples].
+
+    Deliberately independent of XTTS: embedding a voice pool must not require loading
+    2 GB of synthesis checkpoints.
+    """
+    import torchaudio
+
+    wav, sr = torchaudio.load(path)
+    if wav.dim() == 1:
+        wav = wav.unsqueeze(0)
+    if wav.shape[0] > 1:  # downmix stereo; ECAPA2 wants one channel
+        wav = wav.mean(dim=0, keepdim=True)
+    if sr != 16000:
+        wav = torchaudio.functional.resample(wav, orig_freq=sr, new_freq=16000)
+    return wav
+
+
 def duration_seconds(path: str) -> float:
     import librosa
 

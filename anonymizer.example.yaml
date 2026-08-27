@@ -63,7 +63,30 @@ output_sample_rate: 24000
 # list. Overridden by --reference.
 # reference: ./voices/donor_01.wav
 
-# Directory of donor voices used when no reference is given at all. Leave unset to
-# require an explicit --reference.
+# --- choosing the donor automatically ----------------------------------------
+
+# A pool of donor voices to choose from when no reference is given. Either a
+# directory laid out one folder per speaker (voices/<speaker>/*.wav) or a CSV
+# manifest with an audio-path column and, ideally, speaker_id/gender/language
+# columns:
+#
+#   path,speaker_id,gender,language
+#   audio/a.wav,3124,female,de
+#
+# For each input, the pool speaker whose voice is furthest from it is chosen.
 # Env: ANONYMIZER_VOICE_POOL
+# voice_pool: ./pool.csv
+
+# How to pick a donor out of voice_pool:
+#   most_distant  the speaker least similar to the input (default; strongest
+#                 anonymization, and what the research runs used)
+#   none          average the whole pool together, choosing nothing
+selection: most_distant
+
+# How many of the chosen speaker's clips to condition on. XTTS averages the
+# conditioning across them, so a handful is steadier than one.
+select_top_k: 10
+
+# Legacy: a flat directory of donor voices, all averaged together with no
+# selection. Prefer voice_pool above.
 # voice_pool_dir: ./voices

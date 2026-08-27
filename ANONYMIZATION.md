@@ -22,9 +22,13 @@ survives; the original speaker's vocal identity does not.
 
 ```bash
 git clone <this-repo> && cd coqui-tts
-uv sync                       # or: pip install -e .
-anonymize download-model      # ~2 GB of XTTS v2 checkpoints, once
+uv sync                            # or: pip install -e .
+uv run anonymize download-model    # ~2 GB of XTTS v2 checkpoints, once
 ```
+
+`uv sync` installs `anonymize` into the project venv (`.venv/bin`), not onto your shell
+PATH. Every example below is written bare — prefix it with `uv run`, or activate the venv
+once with `source .venv/bin/activate`.
 
 `download-model` writes to `./XTTS_v2.0_original_model_files` by default. Put them
 somewhere else and point at them with `--model-dir`, or:
@@ -95,9 +99,96 @@ To avoid passing `--reference` every time, set a default in your config:
 
 ```yaml
 reference: ./voices/donor_01.wav
-# or, to draw on a whole pool:
-voice_pool_dir: ./voices
 ```
+
+## Choosing the donor automatically
+
+A fixed donor is a weak default: if the donor happens to sound like the person you are
+anonymizing, very little identity is removed. Give the anonymizer a *pool* instead and it
+picks, **for each input**, the pool speaker whose voice is furthest from that input's.
+
+```bash
+anonymize run interview.wav --voice-pool voices/ -o out.wav
+anonymize run interview.wav --voice-pool pool.csv --gender female -o out.wav
+```
+
+Two ways to describe a pool:
+
+**A directory**, one folder per speaker:
+
+```
+voices/
+  spk_a/  clip1.wav clip2.wav
+  spk_b/  clip1.wav
+```
+
+**A CSV manifest**, which is what you want when the audio lives elsewhere or carries
+metadata worth filtering on:
+
+```csv
+path,speaker_id,gender,language
+audio/3124_719_000184.wav,3124,female,de
+audio/3124_719_000185.wav,3124,female,de
+audio/8721_102_000031.wav,8721,male,de
+```
+
+Only the audio-path column is required, and it may be named any of `path`, `file_path`,
+`audio_path`, `wav`, `filename`, … Speaker, gender and language columns are picked up
+under their common aliases too (`speaker`, `predicted_gender`, `lang`), so manifests from
+the research runs load unchanged. Relative paths resolve against the CSV's own directory,
+so a manifest travels with its audio.
+
+### How the donor is chosen
+
+1. Embed the target and every pool clip with ECAPA2.
+2. Score each pool **speaker** by the mean cosine similarity of their clips to the target.
+3. Take the lowest-scoring speaker — the one furthest away.
+4. Within that speaker, condition on their `select_top_k` least-similar clips (default 10).
+
+Filters are applied *before* ranking. If `--gender` or `--pool-language` leaves no
+candidates, the run fails loudly rather than conditioning on an empty reference set.
+
+Preview the choice without synthesizing anything — this loads only ECAPA2, not XTTS:
+
+```bash
+anonymize select interview.wav --voice-pool pool.csv --gender female
+```
+
+```
+ > Chose speaker 8721 out of 240 candidate clip(s)
+ > Mean similarity to the input: -0.0184 (lower is further away)
+ > Conditioning on 10 clip(s):
+     -0.0791  audio/8721_102_000031.wav
+     ...
+ > Speakers ranked furthest-first (top 5):
+      1. 8721                     -0.0184
+      2. 3124                     +0.0072
+```
+
+In Python the same thing is `Anonymizer.select_reference()`, which returns the chosen
+speaker, the clips, and every speaker's score:
+
+```python
+anon = Anonymizer(voice_pool="pool.csv")
+choice = anon.select_reference("interview.wav", gender="female")
+choice.speaker_id, choice.clips, choice.ranked_speakers
+```
+
+The pool is embedded once per `Anonymizer` and cached, so anonymizing a folder against a
+large pool pays that cost a single time. **Selection wants a GPU** — ECAPA2 is impractically
+slow on CPU (tens of seconds per clip).
+
+Set it as a default in your config:
+
+```yaml
+voice_pool: ./pool.csv     # a directory or a CSV manifest
+selection: most_distant    # or "none" to average the whole pool instead
+select_top_k: 10
+```
+
+An explicit `--reference` always wins over the pool. Every anonymization records which
+donor was chosen — `selected_speaker` and `selected_speaker_similarity` land in the batch
+manifest, so a run is auditable after the fact.
 
 ## Modes
 
@@ -122,7 +213,7 @@ CLI flag  >  --config file  >  environment variable  >  built-in default
 ```
 
 Environment variables: `XTTS_MODEL_DIR`, `ANONYMIZER_DEVICE`, `ANONYMIZER_MODE`,
-`ANONYMIZER_WHISPER_MODEL`, `ANONYMIZER_VOICE_POOL`.
+`ANONYMIZER_WHISPER_MODEL`, `ANONYMIZER_VOICE_POOL` (sets `voice_pool`).
 
 Check what you actually resolved:
 
@@ -172,7 +263,8 @@ code is non-zero.
 - **Set the language.** It defaults to English. Pointing it at German audio without
   `--lang de` produces a garbled transcript and therefore garbled output.
 - **Quality depends on the donor.** Noisy, short, or very atypical reference audio gives
-  a weak voice. Use several clean clips of one speaker.
+  a weak voice. Use several clean clips of one speaker, or a pool and let
+  `selection: most_distant` choose.
 - **Transcription errors propagate.** The pipeline resynthesizes from a Whisper
   transcript, so whatever Whisper mishears is what gets spoken. Pass `--text` when you
   have a known-good transcript, or use `--whisper-model large-v3`.
@@ -206,7 +298,8 @@ anonymizer/
   config.py      AnonymizerConfig and its precedence rules
   session.py     lazily-loaded XTTS / Whisper / ECAPA2
   modes.py       single | refine | iterate
-  voices.py      donor voice resolution
+  voices.py      donor voice resolution and voice pools
+  selection.py   choosing the donor furthest from the target
   scoring.py     WER, BLEU, speaker similarity, quality score
   batch.py       folder processing with resumable checkpoints
   audio.py       load / save / denoise helpers

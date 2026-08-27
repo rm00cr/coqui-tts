@@ -78,7 +78,8 @@ target/
 .ipynb_checkpoints
 
 # pyenv
-.python-version
+# .python-version is tracked on purpose: it pins the interpreter uv picks for a fresh clone.
+# .python-version
 
 # celery beat schedule file
 celerybeat-schedule
@@ -172,6 +173,10 @@ local_scripts/*
 coqui_demos/*
 
 *.wav
+# ...except the quickstart sample pair (~460 KB), so a fresh clone can run
+# examples/quickstart.ipynb without hunting for audio.
+!data/TARGET_5s.wav
+!data/REF.wav
 ./test_data/*
 config.json
 vocab.json

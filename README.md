@@ -14,12 +14,14 @@ It covers install, the CLI, batch processing, quality modes, config and limitati
 
 ```bash
 uv sync                       # or: pip install -e .
-anonymize download-model      # ~2 GB of XTTS v2 checkpoints, once
+uv run anonymize download-model   # ~2 GB of XTTS v2 checkpoints, once
 ```
 
 ### Command line
 
-The install puts an `anonymize` command on your path:
+The install puts an `anonymize` command in the project venv. With `uv` it lives in
+`.venv/bin`, so either prefix the examples below with `uv run` or activate the venv
+once (`source .venv/bin/activate`) and call `anonymize` bare:
 
 ```bash
 anonymize run interview.wav --reference donor.wav -o interview_anon.wav

@@ -12,7 +12,7 @@ import argparse
 import sys
 from typing import List, Optional
 
-from .config import MODES
+from .config import MODES, SELECTION_STRATEGIES
 
 
 def _add_common_options(parser: argparse.ArgumentParser) -> None:
@@ -23,6 +23,24 @@ def _add_common_options(parser: argparse.ArgumentParser) -> None:
         "--reference",
         help="donor voice: a wav file, a directory of wavs, or a comma-separated list. "
         "The output will sound like this speaker.",
+    )
+    parser.add_argument(
+        "--voice-pool",
+        dest="voice_pool",
+        help="pool of donor voices to choose from: a directory (pool/<speaker>/*.wav) or "
+        "a CSV manifest with an audio-path column. The donor furthest from each input is "
+        "picked automatically. Env: ANONYMIZER_VOICE_POOL",
+    )
+    parser.add_argument(
+        "--selection",
+        choices=SELECTION_STRATEGIES,
+        help="how to pick a donor from --voice-pool (default: most_distant)",
+    )
+    parser.add_argument(
+        "--select-top-k",
+        dest="select_top_k",
+        type=int,
+        help="how many of the chosen donor's clips to condition on (default: 10)",
     )
     parser.add_argument("--mode", choices=MODES, help="anonymization strategy (default: single)")
     parser.add_argument("--lang", dest="language", help="two-letter language code (default: en)")
@@ -46,9 +64,18 @@ def _config_from_args(args) -> "object":
         for key in (
             "reference", "mode", "language", "model_dir", "device", "whisper_model",
             "iterations", "threshold", "max_attempts", "denoise", "output_sample_rate",
+            "voice_pool", "selection", "select_top_k",
         )
     }
     return AnonymizerConfig.resolve(getattr(args, "config", None), **overrides)
+
+
+def _add_pool_filters(parser: argparse.ArgumentParser) -> None:
+    """Filters applied to the donor pool before a donor is chosen."""
+    parser.add_argument("--gender", help="restrict pool donors to this gender (needs a gender column)")
+    parser.add_argument(
+        "--pool-language", dest="pool_language", help="restrict pool donors to this recording language"
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -66,6 +93,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--text", help="transcript of the input; transcribed with Whisper if omitted")
     run.add_argument("--score", action="store_true", help="also report quality metrics (slower)")
     _add_common_options(run)
+    _add_pool_filters(run)
 
     batch = sub.add_parser("batch", help="anonymize every audio file in a directory")
     batch.add_argument("input_dir", help="directory of audio files")
@@ -73,6 +101,16 @@ def build_parser() -> argparse.ArgumentParser:
     batch.add_argument("--manifest", help="path for the results CSV (default: <output-dir>/manifest.csv)")
     batch.add_argument("--resume", action="store_true", help="skip files already completed")
     _add_common_options(batch)
+    _add_pool_filters(batch)
+
+    select = sub.add_parser(
+        "select",
+        help="show which donor the pool would pick for an input, without synthesizing",
+    )
+    select.add_argument("input", help="audio file to choose a donor for")
+    select.add_argument("--top", type=int, default=5, help="how many ranked speakers to show")
+    _add_common_options(select)
+    _add_pool_filters(select)
 
     download = sub.add_parser("download-model", help="fetch the XTTS v2 checkpoint files (~2 GB)")
     download.add_argument("--dest", help="target directory (default: $XTTS_MODEL_DIR or ./XTTS_v2.0_original_model_files)")
@@ -93,8 +131,19 @@ def _cmd_run(args) -> int:
 
     print(f" > Anonymizing {args.input} (mode={config.mode}, device={config.device})")
     result = anonymizer.anonymize(
-        args.input, reference=config.reference, text=args.text, output_path=args.output
+        args.input,
+        reference=config.reference,
+        text=args.text,
+        output_path=args.output,
+        gender=getattr(args, "gender", None),
+        pool_language=getattr(args, "pool_language", None),
     )
+    if result.info.get("selected_speaker"):
+        print(
+            f" > Donor: speaker {result.info['selected_speaker']} "
+            f"({result.info['selected_clips']} clip(s), similarity "
+            f"{result.info['selected_speaker_similarity']:.3f} — lower is further away)"
+        )
     print(f" > Transcript: {result.text}")
     print(f" > Wrote {result.output_path}")
 
@@ -127,6 +176,8 @@ def _cmd_batch(args) -> int:
         resume=args.resume,
         manifest_path=args.manifest,
         on_progress=progress,
+        gender=getattr(args, "gender", None),
+        pool_language=getattr(args, "pool_language", None),
     )
 
     print(f" > Completed {summary['completed']}/{summary['total']} file(s)")
@@ -137,6 +188,29 @@ def _cmd_batch(args) -> int:
         for failure in summary["failures"]:
             print(f"     {failure['input_path']}: {failure['error']}", file=sys.stderr)
         return 1
+    return 0
+
+
+def _cmd_select(args) -> int:
+    from .pipeline import Anonymizer
+
+    config = _config_from_args(args)
+    anonymizer = Anonymizer(config)
+    result = anonymizer.select_reference(
+        args.input, gender=args.gender, pool_language=args.pool_language
+    )
+
+    print(f" > Pool: {anonymizer.session.voice_pool}")
+    print(f" > Chose speaker {result.speaker_id} out of {result.candidates} candidate clip(s)")
+    print(f" > Mean similarity to the input: {result.speaker_similarity:.4f} (lower is further away)")
+    print(f" > Conditioning on {len(result.clips)} clip(s):")
+    for path, similarity in zip(result.clips, result.clip_similarities):
+        print(f"     {similarity:+.4f}  {path}")
+
+    if args.top:
+        print(f" > Speakers ranked furthest-first (top {args.top}):")
+        for rank, ranked in enumerate(result.ranked_speakers[: args.top], start=1):
+            print(f"     {rank:>2}. {ranked.key:<24} {ranked.similarity:+.4f}")
     return 0
 
 
@@ -158,6 +232,7 @@ def _cmd_config(args) -> int:
 COMMANDS = {
     "run": _cmd_run,
     "batch": _cmd_batch,
+    "select": _cmd_select,
     "download-model": _cmd_download,
     "config": _cmd_config,
 }

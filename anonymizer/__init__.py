@@ -13,10 +13,11 @@ Nothing loads at import time; the checkpoints load on the first `anonymize` call
 reused for the life of the object.
 """
 
-from .config import MODES, AnonymizerConfig
+from .config import MODES, SELECTION_STRATEGIES, AnonymizerConfig
 from .pipeline import AnonymizationResult, Anonymizer, anonymize
+from .selection import SelectionResult, VoiceSelectionError, VoiceSelector, most_distant
 from .session import AnonymizerSession
-from .voices import VoiceResolutionError, resolve_reference
+from .voices import VoiceClip, VoicePool, VoiceResolutionError, resolve_reference
 
 __all__ = [
     "Anonymizer",
@@ -24,9 +25,16 @@ __all__ = [
     "AnonymizerSession",
     "AnonymizationResult",
     "VoiceResolutionError",
+    "VoiceSelectionError",
+    "VoiceSelector",
+    "VoicePool",
+    "VoiceClip",
+    "SelectionResult",
     "anonymize",
     "resolve_reference",
+    "most_distant",
     "MODES",
+    "SELECTION_STRATEGIES",
 ]
 
 __version__ = "0.1.0"

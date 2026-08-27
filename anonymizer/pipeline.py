@@ -76,6 +76,8 @@ class Anonymizer:
         mode: Optional[str] = None,
         output_path: Optional[str] = None,
         denoise: Optional[bool] = None,
+        gender: Optional[str] = None,
+        pool_language: Optional[str] = None,
     ) -> AnonymizationResult:
         """Anonymize one audio file.
 
@@ -89,6 +91,9 @@ class Anonymizer:
             mode: "single", "refine" or "iterate"; defaults to the configured mode.
             output_path: if given, the result is written here.
             denoise: run noise reduction on the target first.
+            gender: restrict pool donors to this gender before choosing one. Only used
+                when a donor is chosen from `voice_pool`.
+            pool_language: restrict pool donors to this recording language.
 
         Returns:
             An `AnonymizationResult`. Its `.wav` is a 1-D float32 array at 24 kHz.
@@ -100,12 +105,10 @@ class Anonymizer:
         mode = mode or config.mode
         language = (language or config.language).lower()
         denoise = config.denoise if denoise is None else denoise
-        references = resolve_reference(
-            reference if reference is not None else config.reference,
-            config.voice_pool_dir,
-        )
-
         with maybe_denoised(target, denoise) as target_path:
+            references, selection_info = self._resolve_donor(
+                target_path, reference, gender=gender, pool_language=pool_language
+            )
             resolved_text = text or self.session.transcribe(target_path, language)
             if not resolved_text.strip():
                 raise ValueError(
@@ -116,6 +119,7 @@ class Anonymizer:
             wav, info = run_mode(
                 mode, self.session, target_path, references, language, resolved_text
             )
+            info.update(selection_info)
 
         result = AnonymizationResult(
             wav=to_numpy(wav),
@@ -129,6 +133,62 @@ class Anonymizer:
         if output_path:
             result.output_path = self.save(result, output_path)
         return result
+
+    def select_reference(
+        self,
+        target: str,
+        gender: Optional[str] = None,
+        pool_language: Optional[str] = None,
+        top_k: Optional[int] = None,
+    ):
+        """Choose the donor furthest from `target` out of the configured `voice_pool`.
+
+        Runs only ECAPA2 — no XTTS, no Whisper — so it is cheap enough to audit a whole
+        pool before committing to a synthesis run.
+
+        Returns:
+            A `SelectionResult`: the chosen speaker, the clips to condition on, and the
+            similarity scores behind the choice.
+        """
+        from .voices import VoiceResolutionError
+
+        pool = self.session.voice_pool
+        if pool is None:
+            raise VoiceResolutionError(
+                "no voice_pool configured. Set voice_pool to a directory of donor audio "
+                "or a CSV manifest, or pass --voice-pool."
+            )
+        return self.session.selector.select(
+            pool,
+            self.session.embed_speaker(target),
+            top_k=top_k or self.config.select_top_k,
+            gender=gender,
+            language=pool_language,
+        )
+
+    def _resolve_donor(self, target_path, reference, gender=None, pool_language=None):
+        """Decide which donor audio to condition on, and say how it was decided.
+
+        Precedence: an explicit `reference` argument, then a configured `reference`, then
+        choosing one out of `voice_pool`, then the legacy flat `voice_pool_dir`.
+        """
+        config = self.config
+        explicit = reference if reference is not None else config.reference
+        if explicit is not None:
+            return resolve_reference(explicit, config.voice_pool_dir), {}
+
+        if config.voice_pool and config.selection != "none":
+            result = self.select_reference(
+                target_path, gender=gender, pool_language=pool_language
+            )
+            return list(result.clips), result.to_info()
+
+        if config.voice_pool:  # selection disabled: average the whole pool, as before
+            from .voices import VoicePool
+
+            return VoicePool.load(config.voice_pool).paths, {"selection": "none"}
+
+        return resolve_reference(None, config.voice_pool_dir), {}
 
     # -- convenience ------------------------------------------------------------
 

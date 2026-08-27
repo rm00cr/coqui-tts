@@ -3,7 +3,7 @@ name = "coqui-tts"
 version = "0.1.0"
 description = "Speaker anonymization for speech, built on Coqui XTTS v2"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.12"
 dependencies = [
     "pyyaml>=6.0",
     "anyascii>=0.3.3",
@@ -64,6 +64,7 @@ requires = [
 "numpy>=1.22.0",
 "packaging",
 ]
+build-backend = "setuptools.build_meta"
 
 [flake8]
 max-line-length=120

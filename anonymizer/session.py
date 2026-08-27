@@ -42,6 +42,8 @@ class AnonymizerSession:
         self._gpt_config = None
         self._asr = None
         self._ecapa = None
+        self._selector = None
+        self._pool = None
 
     # -- checkpoints ------------------------------------------------------------
 
@@ -118,6 +120,31 @@ class AnonymizerSession:
             self._ecapa = torch.jit.load(weights, map_location=self.config.device)
         return self._ecapa
 
+    @property
+    def voice_pool(self):
+        """The configured donor pool, loaded once. None when no pool is configured."""
+        if self._pool is None:
+            spec = self.config.voice_pool
+            if not spec:
+                return None
+            from .voices import VoicePool
+
+            self._pool = VoicePool.load(spec)
+        return self._pool
+
+    @property
+    def selector(self):
+        """A `VoiceSelector` bound to this session's ECAPA2, with a shared cache.
+
+        The cache lives on the session, so a pool is embedded once per session no matter
+        how many targets are anonymized against it.
+        """
+        if self._selector is None:
+            from .selection import VoiceSelector
+
+            self._selector = VoiceSelector(embed=self.embed_speaker)
+        return self._selector
+
     # -- conditioning lengths ---------------------------------------------------
 
     @property
@@ -136,10 +163,15 @@ class AnonymizerSession:
         return self.asr.transcribe(audio_path, **kwargs)["text"].strip()
 
     def embed_speaker(self, audio_path: str):
-        """ECAPA2 embedding for an audio file, resampled to the 16 kHz ECAPA expects."""
-        audio_16k = self.model.resample_audio_16k(audio_path)
+        """ECAPA2 embedding for an audio file, resampled to the 16 kHz ECAPA expects.
+
+        Loads the audio directly rather than through XTTS, so scoring and donor
+        selection work without the synthesis checkpoints being present.
+        """
+        from .audio import load_16k_mono
+
         device = next(self.ecapa.parameters()).device
-        return self.ecapa(audio_16k.to(device=device))
+        return self.ecapa(load_16k_mono(audio_path).to(device=device))
 
     def embed_waveform(self, wav, sample_rate: int = 24000):
         """ECAPA2 embedding for an in-memory waveform."""

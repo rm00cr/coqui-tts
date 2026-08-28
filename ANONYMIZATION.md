@@ -319,3 +319,19 @@ XTTS_MODEL_DIR=./XTTS_v2.0_original_model_files \
 ```
 
 The end-to-end tests skip themselves when the checkpoints are absent.
+
+## Citation
+
+If you use this work, please cite:
+
+```bibtex
+@misc{muletta2026voicecloningsecretlyvoice,
+      title={Your Voice Cloning System is Secretly a Voice Anonymizer},
+      author={Romolo Muletta and Felix Matthias Saaro and Mark Cieliebak and Jan Deriu},
+      year={2026},
+      eprint={2608.27360},
+      archivePrefix={arXiv},
+      primaryClass={cs.CL},
+      url={https://arxiv.org/abs/2608.27360},
+}
+```

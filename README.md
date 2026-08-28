@@ -56,6 +56,22 @@ print(anon.score(result, "interview.wav").to_dict())   # WER, BLEU, speaker simi
 | `tests/anonymizer_tests/` | unit tests that need no model weights, plus end-to-end tests that skip without checkpoints |
 | `model_conf.py` | shim kept for existing scripts; the code moved to `anonymizer/model_setup.py` |
 
+### Citation
+
+If you use this work, please cite:
+
+```bibtex
+@misc{muletta2026voicecloningsecretlyvoice,
+      title={Your Voice Cloning System is Secretly a Voice Anonymizer},
+      author={Romolo Muletta and Felix Matthias Saaro and Mark Cieliebak and Jan Deriu},
+      year={2026},
+      eprint={2608.27360},
+      archivePrefix={arXiv},
+      primaryClass={cs.CL},
+      url={https://arxiv.org/abs/2608.27360},
+}
+```
+
 Everything below is the upstream Coqui TTS README, which still applies to the underlying
 `TTS` package.
 

@@ -30,8 +30,10 @@ uv run anonymize download-model    # ~2 GB of XTTS v2 checkpoints, once
 PATH. Every example below is written bare — prefix it with `uv run`, or activate the venv
 once with `source .venv/bin/activate`.
 
-`download-model` writes to `./XTTS_v2.0_original_model_files` by default. Put them
-somewhere else and point at them with `--model-dir`, or:
+`download-model` writes to `./XTTS_v2.0_original_model_files` by default, and the
+anonymizer looks there on its own, so no further setup is needed. It also finds that
+directory beside the checkout when you run from somewhere else. Keep the checkpoints
+elsewhere and point at them with `--model-dir`, or:
 
 ```bash
 export XTTS_MODEL_DIR=/path/to/checkpoints

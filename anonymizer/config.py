@@ -96,11 +96,11 @@ class AnonymizerConfig:
                 setattr(self, name, fallback)
 
         if self.model_dir is None:
-            # Fall back to whatever model_setup already resolves, so a machine that
-            # worked before keeps working with no config file at all.
-            from .model_setup import DEFAULT_CHECKPOINTS_DIR
+            # Same directory `anonymize download-model` writes to, so a fresh checkout
+            # works with no config file and no environment variable at all.
+            from .download import default_model_dir
 
-            self.model_dir = DEFAULT_CHECKPOINTS_DIR
+            self.model_dir = default_model_dir()
 
         if self.device is None:
             import torch

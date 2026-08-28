@@ -1,20 +1,22 @@
 import torch
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from TTS.api import TTS
 from TTS.tts.layers.xtts.trainer.gpt_trainer import GPTArgs, GPTTrainer, GPTTrainerConfig, XttsAudioConfig
 
+from .download import default_model_dir
+
 #: Where the XTTS v2 checkpoint files (model.pth, dvae.pth, mel_stats.pth, vocab.json,
-#: config.json) live. Override with $XTTS_MODEL_DIR; the historical hardcoded location is
-#: kept as the fallback so existing scripts on this machine keep working unchanged.
-DEFAULT_CHECKPOINTS_DIR = os.getenv(
-    "XTTS_MODEL_DIR", "/home/romolo/VT1/coqui-tts/XTTS_v2.0_original_model_files/"
-)
+#: config.json) live, resolved once at import for callers that want a plain string.
+#: Prefer `default_model_dir()`, which re-reads $XTTS_MODEL_DIR on every call.
+DEFAULT_CHECKPOINTS_DIR = default_model_dir()
 
 
 @dataclass
 class ModelPaths:
-    checkpoints_out_path: str = DEFAULT_CHECKPOINTS_DIR
+    #: Resolved per instance, not at class-definition time, so $XTTS_MODEL_DIR set after
+    #: import is still honoured.
+    checkpoints_out_path: str = field(default_factory=default_model_dir)
     out_path: str = "./"
 
     @property

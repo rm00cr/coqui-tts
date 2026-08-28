@@ -20,12 +20,39 @@ CHECKPOINT_FILES = {
     "model.pth": f"{BASE_URL}/model.pth",
 }
 
+#: Where `download_model` writes when nothing else says otherwise: a copy in the current
+#: working directory, so a checkout keeps the checkpoints next to the code that uses them.
 DEFAULT_DEST = "./XTTS_v2.0_original_model_files"
+
+#: The same directory beside the installed package. Checked as a second candidate so that
+#: `anonymize run` still finds the checkpoints when it is invoked from another directory.
+_PACKAGE_DEST = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "XTTS_v2.0_original_model_files"
+)
 
 
 def missing_files(dest: str) -> List[str]:
     """Names of the checkpoint files not yet present in `dest`."""
     return [name for name in CHECKPOINT_FILES if not os.path.isfile(os.path.join(dest, name))]
+
+
+def default_model_dir() -> str:
+    """The checkpoint directory to use when no path was configured.
+
+    $XTTS_MODEL_DIR wins. Otherwise the first candidate that already holds a complete set
+    of checkpoints is used, and if none does, `DEFAULT_DEST` is returned, which is where
+    `download_model` puts them.
+
+    Resolved on every call rather than once at import, so setting the environment variable
+    from inside a notebook or a test still takes effect.
+    """
+    env = os.getenv("XTTS_MODEL_DIR")
+    if env:
+        return env
+    for candidate in (DEFAULT_DEST, _PACKAGE_DEST):
+        if not missing_files(candidate):
+            return candidate
+    return DEFAULT_DEST
 
 
 def download_model(dest: Optional[str] = None, force: bool = False, progress_bar: bool = True) -> str:
@@ -41,7 +68,7 @@ def download_model(dest: Optional[str] = None, force: bool = False, progress_bar
     """
     from TTS.utils.manage import ModelManager
 
-    dest = dest or os.getenv("XTTS_MODEL_DIR") or DEFAULT_DEST
+    dest = dest or default_model_dir()
     os.makedirs(dest, exist_ok=True)
 
     wanted = list(CHECKPOINT_FILES) if force else missing_files(dest)
